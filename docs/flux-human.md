@@ -388,9 +388,23 @@ if qty < 1
   fail "miqdor noto'g'ri"
 ```
 
+**`fail` status kodi bilan — kutilgan xatolar uchun.** HTTP handler ichida
+`fail` ga status kodini bersangiz, u **avtomat** o'sha statusli javobga
+aylanadi. Bu — `try/catch` o'rnini bosadi: kutilgan xatoda chuqur nesting
+o'rniga shunchaki `fail` qiling:
+```flux
+http.on :post "/transfer" \req ->
+  acc = db.one "select * from accounts where id=$1" [req.body.from]
+  if acc.balance < req.body.amount
+    fail 422 "balans yetarli emas"     # → mijozga 422 {error:"balans yetarli emas"}
+  # ... asosiy yo'l, nesting yo'q
+```
+- `fail 4xx "xabar"` — **kutilgan** (biznes) xato → o'sha statusli JSON javob.
+- `fail "xabar"` (status'siz) — **kutilmagan** xato → 500.
+
 > **Canonical:** `!` = xatoni uzat, `??` = nil'ni almashtir, `fail` = xato
-> chiqar. Har belgi bitta ma'no. Eski tillardagi `try/catch/finally`,
-> `Result.unwrap`, `?.` chalkashligi yo'q.
+> chiqar (status bilan yoki status'siz). Har belgi bitta ma'no. `try/catch`
+> **yo'q** — `fail`+status uning o'rnini bosadi, kod tekis qoladi.
 
 ---
 
@@ -493,7 +507,16 @@ db.up "orders" {total:1500} {id:order_id}
 
 # O'chirish — db.del "jadval" {shart}
 db.del "cart_items" {id:item_id}
+
+# UPSERT — db.put "jadval" {o'zgartirish} {kalit}
+# kalit bo'yicha bor bo'lsa yangilaydi, yo'q bo'lsa qo'shadi (atomik)
+db.put "agent_memory" {val:v} {agent:aid key:k}
 ```
+
+> **`db.put` nega kerak?** "Bor bo'lsa yangila, yo'q bo'lsa qo'sh" naqshi
+> (memory, cache, hisoblagich) uchun. Buni qo'lda `db.one` + `if` + `db.ins`
+> bilan qilsa, ikki parallel so'rov ikkalasi ham "yo'q" deb ko'rib, ikki marta
+> qo'shishi mumkin (race). `db.put` buni atomik qiladi.
 
 **Tranzaksiya — `db.tx`.** Ko'p qadamli mutatsiya **atomik** bo'lishi kerak
 bo'lsa (masalan checkout: buyurtma + qatorlar + stok kamaytirish), `db.tx`
@@ -507,6 +530,41 @@ db.tx \->
     db.up "products" {stock:it.stock - it.qty} {id:it.id}
   db.up "carts" {status::converted} {id:cart.id}
   # blok oxirigacha yetsa — commit. O'rtada fail bo'lsa — hammasi bekor.
+```
+
+`db.tx` qiymat ham qaytaradi (`ret` orqali):
+```flux
+ord = db.tx \->
+  o = db.ins "orders" {...}
+  ret o            # blok qiymati tashqariga
+```
+
+**Concurrency (parallel so'rovlar) kafolati.** `db.tx` avtomat eng kuchli
+izolyatsiyada ishlaydi va konflikt bo'lsa **avtomat qayta uriniladi**. Bu
+shuni anglatadiki, "o'qib → tekshirib → o'zgartirish" naqshi xavfsiz. Masalan,
+bir hisobdan ikki parallel pul yechish — ikkalasi ham bir balansni ko'rib,
+ikkalasi ham o'tib ketmaydi (overdraft bo'lmaydi):
+```flux
+db.tx \->
+  acc = db.one "select * from accounts where id=$1" [aid]
+  if acc.balance < amt
+    fail 422 "balans yetarli emas"
+  db.up "accounts" {balance:acc.balance - amt} {id:aid}   # race-xavfsiz
+```
+> Boshqa tillarda buning uchun `SELECT FOR UPDATE`, lock, mutex yozish kerak.
+> Flux'da — kerak emas, `db.tx` o'zi kafolatlaydi. "Til AI'ga moslashadi":
+> AI lock haqida o'ylamaydi, shunchaki `db.tx` ichiga yozadi.
+
+**Idempotency — bir amalni ikki marta bajarmaslik.** Pul ko'chirish kabi
+joylarda mijoz so'rovni qayta yuborishi mumkin. Unikal kalit (`uniq` ustun)
+bilan himoyalang: avval mavjudini tekshiring, keyin tranzaksiya ichida kalitni
+yozing — dublikat bo'lsa `uniq` xato → tx rollback:
+```flux
+old = db.one "select * from transactions where ikey=$1" [key]
+old ?? (ret old)              # allaqachon bajarilgan → eski natijani qaytar
+db.tx \->
+  db.ins "transactions" {ikey:key amount:amt ...}   # dublikat → uniq → rollback
+  # ... pul ko'chirish
 ```
 > Bu — e-commerce checkout kabi joylar uchun **majburiy**. Tranzaksiyasiz
 > o'rtada xato bo'lsa, ba'zi stok kamaygan, lekin buyurtma yaratilmagan
@@ -530,8 +588,23 @@ tbl products
   price flt
   ts    now
 ```
-Tip kalit so'zlari: `serial int flt str bool json now sym`. Modifikatorlar:
+Tip kalit so'zlari: `serial int flt str bool json now sym money`. Modifikatorlar:
 `pk` (primary key), `uniq`, `null`, `ref:jadval.ustun` (tashqi kalit).
+Ko'p ustunli unikal: jadval tanasida `uniq(agent, key)` (ikki ustun birga
+unikal — masalan har agent uchun har kalit faqat bir marta).
+
+**`json` ustun** — o'qiganda **avtomat map/list** bo'ladi (string emas,
+`json.dec` shart emas); yozganda map/list avtomat enkod qilinadi.
+
+**`money` tipi — pul uchun.** Pul HECH QACHON `flt` (float) bo'lmasligi kerak —
+float yaxlitlash xatosi pulni buzadi. `money` — butun **minor birlik** (tiyin,
+sent): `15000` = 150.00 so'm. Hamma pul-math `money`/`int` bilan (`int` 64-bit):
+```flux
+tbl accounts
+  id      serial pk
+  balance money       # tiyinda, masalan 15000 = 150.00
+total = price * qty   # int math, float emas
+```
 
 **`sym` tipi — enum uchun.** Bu Flux'ning chiroyli yechimi. Ustun `sym`
 bo'lsa: DB'da **matn** saqlanadi, lekin Flux uni o'qiganda avtomat **symbol**
@@ -576,8 +649,6 @@ schema = {
 r = ai.json "Buyurtmani ajrat: ${text}" schema
 # r.intent, r.items[0].product ...
 
-# Agentik tool-loop: AI funksiyalarni o'zi chaqiradi
-javob = ai.run "Mijoz savoliga javob ber" [get_catalog get_history]
 ```
 
 **Audit metadata — avtomat.** Har bir `ai.*` natijasi `_` ostida metadata
@@ -603,7 +674,47 @@ else
 > Real hayotda buni logprob yoki self-eval bilan ta'minlash kerak; til buni
 > batareya ortida yashiradi.
 
-### 9.4 `list` metodlari, `str` / `math` / `rand` / `time` — yadro
+**`ai.run` — agent tool-loop (BIR qadam).** AI tool ishlatmoqchi bo'lsa,
+`ai.run` uni **o'zi bajarmaydi** — sizga *nima qilmoqchiligini* qaytaradi.
+Siz tool'ni bajarib (logging, narx, tasdiq bilan), natijani qaytarib berasiz.
+Loop **qo'lda** — bu sizga to'liq nazorat beradi:
+```flux
+msgs <- [{role::user content:text}]
+each i in 1..10                          # maksimum 10 qadam
+  r = ai.run msgs tools                  # tools: [{name desc params}] ro'yxati
+  if r.kind == :final
+    ret r.text                           # AI tugadi → final javob
+  # r.kind == :call → AI tool chaqirmoqchi
+  out = reg.call r.tool r.args           # tool'ni nomi bilan bajar (pastга qara)
+  log "tool ${r.tool}: ${r._.ms}ms"      # logging/cost/tasdiq shu yerda
+  msgs <- msgs.push {role::tool name:r.tool content:(json.enc out)}
+```
+> `ai.run` ataylab bir qadamli. Agar AI'ning tool chaqiruvlarini avtomat,
+> nazoratsiz bajartirsa, logging/narx/tasdiq qila olmas edingiz. Loop sizniki —
+> shuning uchun har tool chaqiruvini ko'rasiz va boshqarasiz.
+
+### 9.4 `reg` — funksiya registri (dinamik dispatch)
+
+Funksiyani **string nomi bilan** saqlash va chaqirish. Agent tool'lari uchun
+zarur: AI sizga tool **nomini** (matn) beradi, siz uni funksiyaga aylantirib
+chaqirishingiz kerak.
+
+```flux
+reg.add "calc" \args -> args.a + args.b          # nom → funksiya
+reg.add "search" \args -> http.get "/s?q=${args.q}"
+
+out = reg.call "calc" {a:2 b:3}                  # nomi bilan chaqir → 5
+reg.has "search"                                  # ro'yxatda bormi → bool
+reg.names                                         # barcha nomlar ro'yxati
+```
+
+> **Nega `reg` kerak?** Boshqacha bo'lsa, AI'dan kelgan tool nomini
+> `match name` (hardcoded switch) bilan bajarish kerak edi — har yangi tool
+> uchun kodni o'zgartirib. `reg` bilan tool'lar **runtime'da** qo'shiladi
+> (`reg.add`), AI istalganini `reg.call` bilan chaqiradi. Agent platforma
+> aynan shusiz qurib bo'lmaydi.
+
+### 9.5 `list` metodlari, `str` / `math` / `rand` / `time` — yadro
 
 Bularning hammasi **yadro** — `use` qilmasdan ishlaydi (xuddi `log` kabi).
 
@@ -691,20 +802,20 @@ time.fmt t "..."       # timestamp'ni matnga formatlash
 > r = db.one "select count(*) c from tickets where created > $1" [time.ago 24 :hr]
 > ```
 
-### 9.5 `json`
+### 9.6 `json`
 ```flux
 use json
 s = json.enc value     # qiymat → JSON matn
 v = json.dec str       # JSON matn → qiymat
 ```
 
-### 9.6 `env` — muhit o'zgaruvchilari
+### 9.7 `env` — muhit o'zgaruvchilari
 ```flux
 port = env.PORT ?? "8080"      # to'g'ridan-to'g'ri env.NOM
 key = env.AI_KEY
 ```
 
-### 9.7 `cron` — rejalashtirish
+### 9.8 `cron` — rejalashtirish
 Cron — fe'l. Inglizcha o'qiladi:
 ```flux
 use cron
@@ -713,7 +824,7 @@ cron.dy 9 0 daily_check         # kunlik: soat, daqiqa
 cron.hr 30 every_30min          # soatlik: daqiqa
 ```
 
-### 9.8 `queue` — fon navbati
+### 9.9 `queue` — fon navbati
 Webhook tez javob berishi uchun og'ir ishni fonga uzatasiz:
 ```flux
 use queue
@@ -722,7 +833,7 @@ queue.push "send" {ph:phone body:text}    # navbatga qo'shish
 queue.on "send" \job -> tools.send job.ph job.body   # ishlovchi
 ```
 
-### 9.9 `ws` — websocket (realtime)
+### 9.10 `ws` — websocket (realtime)
 
 Real-time ilovalar (chat, jonli yangilanish) uchun. `http` so'rov-javob bo'lsa,
 `ws` doimiy ikki tomonlama ulanish.
@@ -756,7 +867,7 @@ ws.room.members "ch:5"                            # xonadagilar (presence uchun)
 > a'zoligi va presence — `ws.room` ichida boshqariladi, qo'lda shared-state
 > map kerak emas.
 
-### 9.10 `log` — stderr'ga chiqarish
+### 9.11 `log` — stderr'ga chiqarish
 ```flux
 log "xabar"          # diagnostika uchun stderr'ga
 ```

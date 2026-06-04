@@ -116,6 +116,13 @@ p ?? (ask_owner "Narx?"; skip) # nil bo'lsa o'ngdagini bajar
 fail "xato matni"             # o'zing xato chiqar
 ```
 Canonical: `!` uzat, `??` nil almashtir, `fail` chiqar. try/catch YO'Q.
+`fail` status kodi bilan — HTTP handler'da avtomat shu status javobга aylanadi:
+```flux
+if bal < amount
+  fail 422 "balans yetarli emas"   # → mijozga 422 {error:"balans yetarli emas"}
+```
+Kutilgan xato uchun `fail 4xx "..."`, kod tekis qoladi (try/catch shart emas).
+Status'siz `fail "..."` → 500 (kutilmagan xato).
 
 ## Modullar
 ```flux
@@ -154,16 +161,40 @@ one  = db.one "select * from users where id=$1" [id] # → map yoki nil
 row  = db.ins "orders" {cust:5 total:0 status::new}  # → to'liq qator (id bilan)
 db.up "orders" {total:1500} {id:oid}                 # {set} {where}
 db.del "cart_items" {id:iid}                          # o'chirish {where}
+db.put "agent_memory" {val:v} {agent:a key:k}         # UPSERT: bor=yangila, yo'q=qo'sh
 ```
+`db.put "jadval" {set} {key}` — kalit bo'yicha bor bo'lsa yangilaydi, yo'q
+bo'lsa qo'shadi (atomik upsert). Memory/cache uchun (read-then-write race yo'q).
 Tranzaksiya — ko'p qadamli atomik mutatsiya. Blok ichida xato (`fail`/`!`)
-bo'lsa, HAMMA o'zgarish qaytariladi (rollback):
+bo'lsa, HAMMA o'zgarish qaytariladi (rollback). Qiymat qaytaradi (`ret`):
 ```flux
-db.tx \->
+res = db.tx \->
   ord = db.ins "orders" {cust:c total:t}
   each it in items
     db.ins "order_items" {ord:ord.id prod:it.id qty:it.qty}
     db.up "products" {stock:it.stock - it.qty} {id:it.id}
-  # blok muvaffaqiyatli tugasa — commit; fail bo'lsa — hammasi bekor
+  ret ord                      # blok qiymati tashqariga qaytadi
+```
+**Concurrency kafolati:** `db.tx` avtomat eng kuchli izolyatsiyada
+(serializable) ishlaydi va konflikt bo'lsa **avtomat qayta uriniladi**.
+Ya'ni "balansni o'qib, tekshirib, kamaytirish" ichida xavfsiz — ikki parallel
+tranzaksiya bir-birini buzmaydi. Lock haqida o'ylash shart emas:
+```flux
+db.tx \->
+  acc = db.one "select * from accounts where id=$1" [aid]
+  if acc.balance < amt
+    fail 422 "balans yetarli emas"
+  db.up "accounts" {balance:acc.balance - amt} {id:aid}   # race-safe
+```
+**Idempotency** — unikal kalit bilan ikki marta chaqirilmaslik. Kalitni
+tranzaksiya ichida `uniq` ustunga yozing; dublikat bo'lsa tx rollback bo'ladi:
+```flux
+# transactions.ikey ustuni `uniq`. Avval mavjudini tekshir:
+old = db.one "select * from transactions where ikey=$1" [key]
+old ?? (ret old)               # mavjud bo'lsa — eski natijani qaytar
+db.tx \->
+  db.ins "transactions" {ikey:key ...}   # dublikat → uniq xato → rollback
+  ...
 ```
 Parametr `$1 $2...`, qiymat `[...]`. ins/up map kaliti = ustun.
 Param'siz so'rovda ro'yxat shart emas: `db.q "select * from links"`.
@@ -182,7 +213,12 @@ tbl products
   price flt
   ts    now
 ```
-Tiplar: serial int flt str bool json now sym. Modifikator: pk uniq null ref:tbl.col.
+Tiplar: serial int flt str bool json now sym money. Modifikator: pk uniq null ref:tbl.col.
+Ko'p ustunli unique: `uniq(agent, key)` (jadval tanasida alohida qator).
+`json` ustun: o'qiganda avtomat map/list (string EMAS, `json.dec` shart emas);
+yozganda map/list avtomat enkod.
+`money` tipi: butun minor birlik (tiyin/sent), HECH QACHON float — pul uchun.
+`int` 64-bit. Pul math'ni `money`/`int` bilan qiling, `flt` bilan EMAS.
 
 `sym` tipi (enum uchun): DB'da matn saqlanadi, Flux o'qiganda symbol qaytaradi —
 avtomat. Yozish/filter'da symbol avtomat matnga aylanadi:
@@ -206,13 +242,41 @@ r = ai.json "buyurtmani ajrat: ${text}" {    # → schema bo'yicha map
   intent: ":new_order|:question|:other"
   items: [{product:str qty:int}]
 }
-ans = ai.run "javob ber" [get_catalog get_history]  # agentik tool-loop
 ```
 Har ai.* natija `_` metadata olib keladi:
 ```flux
 r._.conf    # ishonch 0..1
 r._.tokens  r._.cost  r._.ms
 ```
+
+**`ai.run` — BIR qadam tool-loop.** AI tool chaqirishni xohlasa, uni O'ZI
+bajarmaydi — sizga **nima qilmoqchiligini** qaytaradi. Siz tool'ni bajarib
+(logging/confirmation bilan), natijani qaytarib berasiz. Loop **qo'lda**:
+```flux
+msgs <- [{role::user content:text}]
+each i in 1..10                        # maks 10 qadam
+  r = ai.run msgs tools                # tools — ro'yxat: [{name desc params}]
+  if r.kind == :final
+    ret r.text                         # AI tugadi → final javob
+  # r.kind == :call → AI tool chaqirmoqchi: r.tool, r.args
+  out = reg.call r.tool r.args         # tool'ni nomi bilan bajar (pastga qara)
+  log "tool ${r.tool}: ${r._.ms}ms"    # logging/confirmation shu yerda
+  msgs <- msgs.push {role::tool name:r.tool content:(json.enc out)}
+```
+Nazorat kerak bo'lgani uchun (logging, cost, tasdiq) `ai.run` ataylab bir
+qadamli — loop sizniki.
+
+### reg (tool/funksiya registri — dinamik dispatch)
+Funksiyani STRING nomi bilan saqlash va chaqirish (agent tool'lari uchun):
+```flux
+reg.add "calc" \args -> args.a + args.b      # nom → funksiya
+reg.add "search" \args -> http.get "/s?q=${args.q}"
+out = reg.call "calc" {a:2 b:3}              # nomi bilan chaqir → 5
+reg.has "calc"                                # bormi → bool
+reg.names                                     # ro'yxatdagi nomlar
+```
+Agent AI'dan kelgan tool nomini `reg.call` bilan bajaradi — `match`-switch
+EMAS. Yangi tool runtime'da qo'shiladi (`reg.add`).
 Confidence routing:
 ```flux
 if r._.conf > 0.85

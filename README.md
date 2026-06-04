@@ -43,9 +43,10 @@ Mana butun ilova. Paket o'rnatish yo'q, ulanish kodi yo'q, boilerplate yo'q.
    Kalit so'zlar to'liq (`each`, `match`, `else`) — Flux'ni birinchi marta
    ko'rgan AI ham darhol tushunadi.
 
-3. **Batteries included.** `http`, `db`, `ai`, `ws`, `cron`, `queue`, `json` —
-   hammasi tilning ichida. `npm install` yo'q. Compile vaqtida faqat
-   ishlatilgani binary'ga kiradi (tree-shaking).
+3. **Batteries included.** `http`, `db` (tranzaksiya + concurrency kafolati),
+   `ai`, `reg` (tool registry), `ws`, `cron`, `queue`, `json` — hammasi tilning
+   ichida. `npm install` yo'q. Compile vaqtida faqat ishlatilgani binary'ga
+   kiradi (tree-shaking).
 
 4. **AI — birinchi darajali primitiv.** LLM chaqirish — kalit so'z, SDK emas:
    ```fx
