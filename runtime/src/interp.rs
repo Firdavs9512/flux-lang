@@ -20,11 +20,31 @@ use crate::value::{FnValue, Value};
 // `fib`) bir-birini bloklamasdan o'qiydi. Yozish (`<-`, bind) eksklyuziv.
 pub type Env = Arc<RwLock<Scope>>;
 
+// Scope zanjirining ota-havolasi. Muhim: ROOT (global) scope barcha thread'lar
+// orasida ULASHILADI — uni har lookup'da klonlash/lock qilish atomik
+// contention'ning asosiy manbai (cache-line bouncing 8 core'da). Shuning uchun
+// root'ga yetadigan zanjir `Parent::Root(env)` ishlatadi: root Arc saqlanadi
+// (oraliq scope'lar uni HECH QACHON klonlamaydi), va global muzlatilgandan keyin
+// lookup root Arc'ga TEGMASDAN lock-free frozen snapshot'dan o'qiydi.
+#[derive(Clone)]
+pub enum Parent {
+    // Root scope'ning o'zi — yuqorida ota yo'q.
+    None,
+    // Ota — root (global) scope. MARKER (Arc emas!) — root Arc saqlanmaydi,
+    // shuning uchun fn chaqiruvi/scope ochilishida root refcount ATOMIK
+    // urilmaydi (cache-line bouncing yo'q). Muzlatilgach lookup frozen
+    // snapshot'dan, muzlatilmagan (top-level) holatda `Interp.global` Arc'idan
+    // o'qiydi — ikkalasi ham `&self` orqali, klon shart emas.
+    Root,
+    // Ota — oddiy (root bo'lmagan) scope.
+    Scope(Env),
+}
+
 pub struct Scope {
     vars: HashMap<String, Value>,
     // mutable (`<-`) sifatida e'lon qilingan nomlar — qayta tayinlashga ruxsat.
     mutable: HashMap<String, bool>,
-    parent: Option<Env>,
+    parent: Parent,
     // Bu scope root (global)mi? lookup root'ga yetganda, agar Interp global'ni
     // muzlatgan bo'lsa, lock-free snapshot'dan o'qiydi (parallel contention yo'q).
     is_root: bool,
@@ -35,17 +55,36 @@ impl Scope {
         Arc::new(RwLock::new(Scope {
             vars: HashMap::new(),
             mutable: HashMap::new(),
-            parent: None,
+            parent: Parent::None,
             is_root: true,
         }))
     }
-    fn child(parent: &Env) -> Env {
+    // Berilgan `Parent` havola ostida yangi (bo'sh) child scope. `apply`/`if`/
+    // `each`/`match` shu orqali scope ochadi. MUHIM: parent'ni LOCK QILMAYDI —
+    // havola turi (Root/Scope) chaqiruvchidan keladi, shuning uchun rekursiv
+    // fn chaqiruvida root Arc'ga umuman tegilmaydi (contention yo'q).
+    fn child(parent: Parent) -> Env {
         Arc::new(RwLock::new(Scope {
             vars: HashMap::new(),
             mutable: HashMap::new(),
-            parent: Some(parent.clone()),
+            parent,
             is_root: false,
         }))
+    }
+    // `env` Arc'ni child uchun ota-havolaga aylantiradi (faqat `is_root` ni
+    // bilish uchun bitta lock). Top-level kod (if/each/match global env'da) shu
+    // orqali boradi — single-threaded, contentionsiz. Fn chaqiruvi esa
+    // `FnValue.parent` (Parent) ni to'g'ridan ishlatadi, bu yo'lga kirmaydi.
+    fn parent_link(env: &Env) -> Parent {
+        if env.read().is_root {
+            Parent::Root
+        } else {
+            Parent::Scope(env.clone())
+        }
+    }
+    // Berilgan env ostida child (yuqoridagi ikkisini birlashtiradi).
+    fn child_of(env: &Env) -> Env {
+        Scope::child(Scope::parent_link(env))
     }
     // Builtins o'rnatish uchun: global nomga immutable qiymat qo'yadi.
     pub fn set_global(&mut self, name: &str, v: Value) {
@@ -189,7 +228,8 @@ impl Interp {
                     let f = Value::Fn(Arc::new(FnValue {
                         params: params.clone(),
                         body: body.clone(),
-                        closure: self.global.clone(),
+                        // Top-level fn — ota root (marker, Arc emas).
+                        parent: Parent::Root,
                         name: name.clone(),
                     }));
                     self.global.write().vars.insert(name.clone(), f);
@@ -268,7 +308,7 @@ impl Interp {
                 let f = Value::Fn(Arc::new(FnValue {
                     params: params.clone(),
                     body: body.clone(),
-                    closure: env.clone(),
+                    parent: Scope::parent_link(env),
                     name: name.clone(),
                 }));
                 env.write().vars.insert(name.clone(), f);
@@ -317,6 +357,7 @@ impl Interp {
     // `<-` qayta tayinlash: o'zgaruvchini scope zanjirida topib yangilaydi.
     // Topilmasa — joriy scope'da mutable sifatida yaratadi.
     fn assign(&self, name: &str, v: Value, env: &Env) -> Result<(), Flow> {
+        let frozen = self.globals_frozen.get().is_some();
         let mut cur = env.clone();
         loop {
             // Bitta write lock ostida: nomni topib yangilash YOKI keyingi ota'ni
@@ -337,8 +378,18 @@ impl Interp {
                 s.parent.clone()
             };
             match parent {
-                Some(p) => cur = p,
-                None => break,
+                Parent::Scope(p) => cur = p,
+                // Ota — root (marker). Muzlatilgandan keyin global immutable
+                // (handler'da global'ga `<-` yo'q) — root'ga TEGMAYMIZ, joriy
+                // scope'da yangi lokal yaratamiz. Muzlatilmagan (top-level) bo'lsa
+                // `Interp.global` ni odatdagidek qidiramiz/o'zgartiramiz.
+                Parent::Root => {
+                    if frozen {
+                        break;
+                    }
+                    cur = self.global.clone();
+                }
+                Parent::None => break,
             }
         }
         // yangi mutable o'zgaruvchi
@@ -368,7 +419,7 @@ impl Interp {
             }
         };
         for (key, val) in items {
-            let loop_env = Scope::child(env);
+            let loop_env = Scope::child_of(env);
             {
                 let mut s = loop_env.write();
                 if vars.len() == 2 {
@@ -500,7 +551,7 @@ impl Interp {
             Expr::Lambda { params, body } => Ok(Value::Fn(Arc::new(FnValue {
                 params: params.clone(),
                 body: body.clone(),
-                closure: env.clone(),
+                parent: Scope::parent_link(env),
                 name: "<lambda>".to_string(),
             }))),
             Expr::Call { callee, args } => self.eval_call(callee, args, env),
@@ -546,8 +597,7 @@ impl Interp {
             // operatsiyasi; parallel request'lar global root'da urilardi.)
             let parent = {
                 let s = cur.read();
-                // root'ga yetdik va global muzlatilgan bo'lsa — LOCK-FREE
-                // snapshot'dan o'qiymiz, parallel request'lar urilmaydi.
+                // root scope'ning O'ZI muzlatilgan bo'lsa — lock-free snapshot.
                 if s.is_root
                     && let Some(frozen) = frozen
                 {
@@ -562,8 +612,22 @@ impl Interp {
                 s.parent.clone()
             };
             match parent {
-                Some(p) => cur = p,
-                None => return Err(Flow::err(format!("noma'lum nom: {}", name))),
+                Parent::None => return Err(Flow::err(format!("noma'lum nom: {}", name))),
+                Parent::Scope(p) => cur = p,
+                Parent::Root => {
+                    // Ota — root (marker). Muzlatilgan bo'lsa root Arc'ga TEGMASDAN
+                    // frozen snapshot'dan o'qiymiz — parallel request'lar bu yerda
+                    // urilmaydi (atomik contention yo'q). Aks holda (top-level,
+                    // muzlatilmagan) `Interp.global` Arc'iga o'tamiz — klon shart
+                    // emas, `&self` orqali kelyapti.
+                    if let Some(frozen) = frozen {
+                        return frozen
+                            .get(name)
+                            .cloned()
+                            .ok_or_else(|| Flow::err(format!("noma'lum nom: {}", name)));
+                    }
+                    cur = self.global.clone();
+                }
             }
         }
     }
@@ -571,12 +635,12 @@ impl Interp {
     fn eval_if(&self, ifx: &IfExpr, env: &Env) -> EvalResult {
         for (cond, block) in &ifx.arms {
             if self.eval(cond, env)?.truthy() {
-                let inner = Scope::child(env);
+                let inner = Scope::child_of(env);
                 return self.exec_block(block, &inner);
             }
         }
         if let Some(eb) = &ifx.else_block {
-            let inner = Scope::child(env);
+            let inner = Scope::child_of(env);
             return self.exec_block(eb, &inner);
         }
         Ok(Value::Nil)
@@ -591,7 +655,7 @@ impl Interp {
                 MatchPat::Int(n) => matches!(&subj, Value::Int(v) if v == n),
             };
             if matched {
-                let inner = Scope::child(env);
+                let inner = Scope::child_of(env);
                 return self.exec_block(&arm.body, &inner);
             }
         }
@@ -779,7 +843,7 @@ impl Interp {
                         args.len()
                     )));
                 }
-                let call_env = Scope::child(&fv.closure);
+                let call_env = Scope::child(fv.parent.clone());
                 {
                     let mut s = call_env.write();
                     for (p, a) in fv.params.iter().zip(args) {
