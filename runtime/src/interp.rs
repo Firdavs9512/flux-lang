@@ -319,7 +319,9 @@ impl Interp {
     fn assign(&self, name: &str, v: Value, env: &Env) -> Result<(), Flow> {
         let mut cur = env.clone();
         loop {
-            {
+            // Bitta write lock ostida: nomni topib yangilash YOKI keyingi ota'ni
+            // olish (avval write + alohida read — ikki lock har leveldda edi).
+            let parent = {
                 let mut s = cur.write();
                 if s.vars.contains_key(name) {
                     if s.mutable.get(name) == Some(&false) {
@@ -332,8 +334,8 @@ impl Interp {
                     s.mutable.insert(name.to_string(), true);
                     return Ok(());
                 }
-            }
-            let parent = cur.read().parent.clone();
+                s.parent.clone()
+            };
             match parent {
                 Some(p) => cur = p,
                 None => break,
@@ -533,14 +535,21 @@ impl Interp {
     }
 
     fn lookup(&self, name: &str, env: &Env) -> EvalResult {
+        // Muzlatilgan global snapshot'ni bir marta lock-free olamiz (OnceLock
+        // o'qishi atomik yuklash — qulf emas).
+        let frozen = self.globals_frozen.get();
         let mut cur = env.clone();
         loop {
-            // root scope'ga yetdik va global muzlatilgan bo'lsa — LOCK-FREE
-            // o'qiymiz (Arc snapshot). Parallel request'lar bu yerda urilmaydi.
-            {
+            // Har leveldagi scope'ni BITTA read lock ostida ko'ramiz: ham
+            // o'zgaruvchini qidiramiz, ham keyingi ota'ni olamiz. (Avval ikkita
+            // alohida `cur.read()` bor edi — har biri parking_lot RwLock atomik
+            // operatsiyasi; parallel request'lar global root'da urilardi.)
+            let parent = {
                 let s = cur.read();
+                // root'ga yetdik va global muzlatilgan bo'lsa — LOCK-FREE
+                // snapshot'dan o'qiymiz, parallel request'lar urilmaydi.
                 if s.is_root
-                    && let Some(frozen) = self.globals_frozen.get()
+                    && let Some(frozen) = frozen
                 {
                     return frozen
                         .get(name)
@@ -550,8 +559,8 @@ impl Interp {
                 if let Some(v) = s.vars.get(name) {
                     return Ok(v.clone());
                 }
-            }
-            let parent = cur.read().parent.clone();
+                s.parent.clone()
+            };
             match parent {
                 Some(p) => cur = p,
                 None => return Err(Flow::err(format!("noma'lum nom: {}", name))),
