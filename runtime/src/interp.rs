@@ -399,7 +399,6 @@ impl Interp {
     // `<-` qayta tayinlash: o'zgaruvchini scope zanjirida topib yangilaydi.
     // Topilmasa — joriy scope'da mutable sifatida yaratadi.
     fn assign(&self, name: &str, v: Value, env: &Env) -> Result<(), Flow> {
-        let frozen = self.globals_frozen.get().is_some();
         let mut cur = env.clone();
         loop {
             // Bitta write lock ostida: nomni topib yangilash YOKI keyingi ota'ni
@@ -420,12 +419,23 @@ impl Interp {
             };
             match parent {
                 Parent::Scope(p) => cur = p,
-                // Ota — root (marker). Muzlatilgandan keyin global immutable
-                // (handler'da global'ga `<-` yo'q) — root'ga TEGMAYMIZ, joriy
-                // scope'da yangi lokal yaratamiz. Muzlatilmagan (top-level) bo'lsa
+                // Ota — root (marker). Muzlatilgandan keyin global FROZEN
+                // (immutable snapshot) — root'ga TEGMAYMIZ. Agar nom global
+                // sifatida mavjud bo'lsa, uni handler ichidan `<-` bilan
+                // o'zgartirib bo'lmaydi: ANIQ xato beramiz (jim shadow EMAS —
+                // dasturchi jim muvaffaqiyatsizlikka uchramasin). Nom yangi bo'lsa
+                // joriy scope'da lokal yaratamiz. Muzlatilmagan (top-level) bo'lsa
                 // `Interp.global` ni odatdagidek qidiramiz/o'zgartiramiz.
                 Parent::Root => {
-                    if frozen {
+                    if let Some(frozen) = self.globals_frozen.get() {
+                        if frozen.contains_key(name) {
+                            return Err(Flow::err(format!(
+                                "'{}' global muzlatilgan (server ishga tushgan) — \
+                                 handler ichidan '<-' bilan o'zgartirib bo'lmaydi; \
+                                 ulashilgan o'zgaruvchan holat uchun db'dan foydalaning",
+                                name
+                            )));
+                        }
                         break;
                     }
                     cur = self.global.clone();
@@ -891,9 +901,12 @@ impl Interp {
                 {
                     let mut s = call_env.write();
                     for (p, a) in fv.params.iter().zip(args) {
-                        // define o'rniga to'g'ridan push — params unikal (parser
-                        // takror param'ni bermaydi), dublikat tekshiruv shart emas.
-                        s.vars.push((p.as_str().into(), a, true));
+                        // `define` ishlatamiz (xom push emas): parser takror
+                        // param'ni rad etadi, lekin define defensive — agar nom
+                        // baribir takrorlansa write/read bitta slot'da qoladi
+                        // (define-oldindan / get-orqadan zidligi yuzaga kelmaydi).
+                        // Params kichik (0-4), O(n²) arzon. Mutable: tana `<-` qila oladi.
+                        s.define(p, a, true);
                     }
                 }
                 match self.exec_block(&fv.body, &call_env) {
