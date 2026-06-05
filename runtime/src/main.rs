@@ -17,6 +17,7 @@ mod http_mod;
 mod interp;
 mod lexer;
 mod parser;
+mod queue_mod;
 mod reg_mod;
 mod token;
 mod value;
@@ -516,6 +517,53 @@ cron.on 99 * * * * f
         assert!(
             err.contains("cron") && err.to_lowercase().contains("ifoda"),
             "kutilgan cron ifoda xatosi, topildi: {}",
+            err
+        );
+    }
+
+    // --- queue battery ---
+
+    #[test]
+    fn queue_on_push_registratsiya_xatosiz() {
+        // queue.on handler ro'yxatga oladi, queue.push ish qo'shadi — ikkalasi ham
+        // bloklamaydi, dastur tugaydi (worker fonda ishlayveradi). Handler bittagina
+        // `job` map argumenti oladi.
+        run(r#"
+queue.on "send" \job ->
+  log "yuborilmoqda: ${job.ph}"
+queue.push "send" {ph:"+99890" body:"salom"}
+"#);
+    }
+
+    #[test]
+    fn queue_push_payloadsiz() {
+        // Payload ixtiyoriy — berilmasa job Nil bo'ladi.
+        run(r#"
+queue.on "tozala" \job ->
+  log "tozalandi"
+queue.push "tozala"
+"#);
+    }
+
+    #[test]
+    fn queue_push_nom_str_bolmasa_xato() {
+        // 1-argument ish nomi str bo'lishi shart.
+        let err = run_source(r#"queue.push 5"#).expect_err("nom str bo'lmasa xato kutiladi");
+        assert!(
+            err.contains("queue.push"),
+            "kutilgan queue.push xatosi, topildi: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn queue_on_handler_fn_bolmasa_xato() {
+        // 2-argument handler fn bo'lishi shart.
+        let err =
+            run_source(r#"queue.on "send" 5"#).expect_err("handler fn bo'lmasa xato kutiladi");
+        assert!(
+            err.contains("queue.on"),
+            "kutilgan queue.on xatosi, topildi: {}",
             err
         );
     }
