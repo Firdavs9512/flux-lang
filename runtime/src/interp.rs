@@ -651,6 +651,19 @@ impl Interp {
                     if id == "reg" && self.lookup(id, env).is_err() {
                         return self.reg_dispatch(name, vec![]);
                     }
+                    // `cron.run` argumentsiz -> Call emas, Field bo'lib keladi. cron
+                    // o'zgaruvchi sifatida e'lon qilinmagan bo'lsa, argumentsiz cron
+                    // funksiyasi (run) sifatida chaqiramiz. (Aks holda `cron` ident
+                    // o'zgaruvchi deb qidirilib "noma'lum nom" beradi.)
+                    if id == "cron" && self.lookup(id, env).is_err() {
+                        return self.arc_self().cron_dispatch(name, vec![]);
+                    }
+                    // queue ham state'li modul — argumentsiz chaqiruvi (kelajakda)
+                    // shu yerda ushlanadi; aks holda `queue` ident o'zgaruvchi deb
+                    // qidirilib "noma'lum nom" beradi.
+                    if id == "queue" && self.lookup(id, env).is_err() {
+                        return self.arc_self().queue_dispatch(name, vec![]);
+                    }
                 }
                 let t = self.eval(target, env)?;
                 self.get_field(&t, name, env)

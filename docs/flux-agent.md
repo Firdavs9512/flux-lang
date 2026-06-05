@@ -239,7 +239,8 @@ Og'ir ishni fonga uzat — `push`/`on` bloklamaydi, worker FIFO bajaradi:
 queue.on "send" \job -> tools.send job.ph job.body   # job = push payload
 queue.push "send" {ph:p body:t}                       # payload ixtiyoriy
 ```
-push handler'dan oldin yozilsa ish navbatda kutadi.
+push handler'dan oldin yozilsa ish navbatda kutadi. queue'ning o'z `run`'i YO'Q —
+processni `http.serve`/`ws.serve`/`cron.run` ushlab tursa worker fonda ishlaydi.
 
 ### ws (websocket — realtime)
 ```flux
