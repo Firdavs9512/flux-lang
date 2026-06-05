@@ -18,3 +18,6 @@ runtime/target/
 *.db
 *.db-shm
 *.db-wal
+
+# ai agent folders
+.claude/
