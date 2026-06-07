@@ -57,6 +57,15 @@ pub enum Expr {
         body: Vec<Stmt>,
     },
 
+    // source [live] db.q "..."  — reaktiv data o'rovi (frontend). `inner` =
+    // backend chaqiruv (db.q/db.one/http.get). `live` = WS subscription bayrog'i
+    // (PR-7a'da parse qilinadi lekin xatti-harakatga ta'sir qilmaydi — PR-7b WS).
+    // Eval natijasi {__source:true tag data loading err reload} map (interp).
+    Source {
+        inner: Box<Expr>,
+        live: bool,
+    },
+
     // error-propagate: expr!
     Try(Box<Expr>),
 

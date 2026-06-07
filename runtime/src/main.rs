@@ -1609,6 +1609,118 @@ page "/" -> app
         );
     }
 
+    // PR-7a: source SSR — db.q server'da bajariladi, .data to'la keladi (loading=false).
+    #[test]
+    fn source_ssr_data() {
+        with_db_test("source_ssr", || {
+            run(r#"
+use db
+tbl gul
+  id   serial pk
+  name str
+db.ins "gul" {name:"Atirgul"}
+db.ins "gul" {name:"Lola"}
+
+view shop
+  items <- source db.q "select * from gul order by id"
+  h1 "Soni: ${items.data.len}"
+  each g in items.data
+    p g.name
+
+out = ui.html (shop())
+(str.has out "Soni: 2") | (fail "source .data.len 2 bo'lishi kerak: ${out}")
+(str.has out "<p>Atirgul</p>") | (fail "qator render bo'lmadi: ${out}")
+(str.has out "<p>Lola</p>") | (fail "ikkinchi qator yo'q: ${out}")
+"#);
+        });
+    }
+
+    // PR-7a: source xatosi -> .err str, .data nil, PANIC YO'Q (spec items.err).
+    #[test]
+    fn source_xato_err() {
+        with_db_test("source_xato", || {
+            run(r#"
+use db
+view shop
+  items <- source db.q "select * from yoq_jadval"
+  if items.err
+    p "Xato bor"
+  else
+    p "OK"
+
+out = ui.html (shop())
+(str.has out "Xato bor") | (fail "items.err to'lishi kerak: ${out}")
+"#);
+        });
+    }
+
+    // PR-7a: source.loading=false (SSR data to'la), reload() xato bermaydi (no-op Nil).
+    #[test]
+    fn source_loading_reload() {
+        with_db_test("source_loading", || {
+            run(r#"
+use db
+tbl t
+  id   serial pk
+  name str
+db.ins "t" {name:"x"}
+
+view shop
+  items <- source db.q "select * from t"
+  if items.loading
+    p "yuklanmoqda"
+  else
+    p "tayyor"
+  r = items.reload()
+
+out = ui.html (shop())
+(str.has out "tayyor") | (fail "SSR'da loading false bo'lishi kerak: ${out}")
+"#);
+        });
+    }
+
+    // PR-7a: source'li view /_fx/event island re-render -> source QAYTA bajariladi
+    // (invalidate/reload oqimi: yangilangan data bilan HTML).
+    #[test]
+    fn source_fx_event_re_render() {
+        with_db_test("source_fx_event", || {
+            let src = r#"
+use db
+tbl gul
+  id   serial pk
+  name str
+db.ins "gul" {name:"Atirgul"}
+
+view shop
+  q <- ""
+  items <- source db.q "select * from gul order by id"
+  div {kind::panel}
+    input {bind:q}
+    each g in items.data
+      if str.has g.name q
+        p g.name
+
+page "/" -> shop
+"#;
+            let toks = lexer::lex(src).expect("lex");
+            let prog = parser::parse(toks).expect("parse");
+            let interp = interp::Interp::new_arc();
+            interp.run(&prog).expect("run");
+            // Island re-render (q="Atir") -> source qayta bajarilib filtr ishlaydi.
+            let body =
+                br#"{"page":"/","island":1,"event":"input","handler":"q","state":{"q":"Atir"}}"#;
+            let html = match ui_mod::fx_event_render(&interp, body) {
+                Ok(h) => h,
+                Err(_) => panic!("fx_event_render xato"),
+            };
+            assert!(
+                html.contains("<p>Atirgul</p>"),
+                "source qayta bajarilib filtr ishlashi kerak: {}",
+                html
+            );
+        });
+    }
+
     // PR-4b: sof statik sahifa 0 JS (CDN-cacheable invariant).
     #[test]
     fn sof_statik_nol_js() {

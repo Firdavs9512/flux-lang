@@ -47,6 +47,19 @@ fn fx_seed_value(name: &str) -> Option<Value> {
     FX_RENDER_STATE.with(|c| c.borrow().as_ref().and_then(|m| m.get(name).cloned()))
 }
 
+// Source inner natijasidan `.data`ni ajratadi (PR-7a). External `http.get`
+// `{status headers body}` map qaytaradi — spec: `.data` = body (status/headers'siz).
+// db.q (List) / db.one (Map/Nil) to'g'ridan data bo'ladi.
+fn source_data(v: Value) -> Value {
+    if let Value::Map(m) = &v
+        && m.contains_key("status")
+        && m.contains_key("body")
+    {
+        return m.get("body").cloned().unwrap_or(Value::Nil);
+    }
+    v
+}
+
 // PR-6: `on:click` handler tanasi registri (inline lambda -> Value::Fn). HTML
 // atributga funksiya yozib bo'lmaydi, shuning uchun render paytida lambda'ni shu
 // registrga push qilamiz va marker `#N` (indeks) bo'ladi; event kelganda client
@@ -846,9 +859,17 @@ impl Interp {
                 // PR-5a: island re-render'da reaktiv (`<-`) initial qiymatini
                 // client state'dan olamiz (seed bo'lsa). `q <- ""` -> q = "atir"
                 // (client yuborgan). Oddiy render'da seed None -> eval qiymati.
-                let v = match fx_seed_value(name) {
-                    Some(seeded) => seeded,
-                    None => self.eval(value, env)?,
+                //
+                // PR-7a: `items <- source ...` — source tag'i = bind nomi (ui.invalidate
+                // :items uchun). Source seed QILINMAYDI (server-only data, client'ga
+                // .data DTO sifatida SSR'da to'la keladi); har render server'da qayta
+                // bajariladi (invalidate/reload oqimi).
+                let v = match value {
+                    Expr::Source { inner, live } => self.eval_source(inner, name, *live, env)?,
+                    _ => match fx_seed_value(name) {
+                        Some(seeded) => seeded,
+                        None => self.eval(value, env)?,
+                    },
                 };
                 self.assign(name, v, env)?;
                 Ok(Value::Nil)
@@ -1310,6 +1331,9 @@ impl Interp {
                 name: "<lambda>".to_string(),
                 is_view: false,
             }))),
+            // source — odatda `items <- source ...` (Assign tag beradi). Bu yerda
+            // (Assign'dan tashqari, masalan `x = source ...`) anonim tag bilan.
+            Expr::Source { inner, live } => self.eval_source(inner, "", *live, env),
             Expr::Call { callee, args } => self.eval_call(callee, args, env),
             Expr::Try(inner) => {
                 // expr! — agar inner fail/err qaytarsa, yuqoriga uzatamiz;
@@ -1783,6 +1807,37 @@ impl Interp {
         }
     }
 
+    // PR-7a: `source [live] db.q/http.get ...` ni eval qiladi -> {__source...} map.
+    // `tag` = bind nomi (ui.invalidate :tag uchun). SSR-first: inner SERVERDA
+    // bajariladi, .data to'la keladi (loading=false). Xato bo'lsa panic emas —
+    // {err:Str} (spec: items.err). `live` PR-7a'da bayroq (WS PR-7b).
+    fn eval_source(&self, inner: &Expr, tag: &str, _live: bool, env: &Env) -> EvalResult {
+        // inner (db.q/db.one/http.get) ni bajaramiz; biznes xatosini .err ga aylantirib
+        // ushlaymiz, runtime oqim xatosini (skip/stop/return) yuqoriga uzatamiz.
+        let (data, err) = match self.eval(inner, env) {
+            Ok(v) => (source_data(v), Value::Nil),
+            Err(Flow::Error(m)) => (Value::Nil, Value::Str(m)),
+            Err(Flow::Fail { message, .. }) => (Value::Nil, Value::Str(message)),
+            Err(other) => return Err(other),
+        };
+
+        let mut m = BTreeMap::new();
+        m.insert("__source".to_string(), Value::Bool(true));
+        m.insert("tag".to_string(), Value::Str(tag.to_string()));
+        m.insert("data".to_string(), data);
+        m.insert("loading".to_string(), Value::Bool(false));
+        m.insert("err".to_string(), err);
+        // reload() — PR-7a'da no-op (SSR data to'la). PR-7b'da client trigger.
+        m.insert(
+            "reload".to_string(),
+            Value::Native(Arc::new(crate::value::NativeFn {
+                name: "source.reload".to_string(),
+                func: Box::new(|_| Ok(Value::Nil)),
+            })),
+        );
+        Ok(Value::Map(m))
+    }
+
     // View'ni render qiladi VA uning call scope'ini ham qaytaradi (PR-6). `apply`
     // call_env'ni tashlaydi, lekin event handler'ni o'sha scope'da apply qilib
     // `<-` state'ni o'qishimiz kerak (handler `count <- count+1` view scope'dagi
@@ -2106,6 +2161,40 @@ mod fx_handler_tests {
             as_int(interp.read_var(&scope, "count")),
             Some(7),
             "scope'da count o'qilishi kerak"
+        );
+    }
+}
+
+#[cfg(test)]
+mod source_tests {
+    use crate::ast::{Expr, Stmt};
+    use crate::lexer::lex;
+    use crate::parser::parse;
+
+    // `items <- source db.q "..."` -> Stmt::Assign{value: Expr::Source{live:false}}.
+    #[test]
+    fn source_parse_statik() {
+        let prog = parse(lex("items <- source db.q \"select 1\"\n").unwrap()).unwrap();
+        let Stmt::Assign { name, value } = &prog[0] else {
+            panic!("Assign kutilgan");
+        };
+        assert_eq!(name, "items");
+        assert!(
+            matches!(value, Expr::Source { live: false, .. }),
+            "Expr::Source{{live:false}} kutilgan"
+        );
+    }
+
+    // `source live ...` -> live:true bayroq (PR-7a parse, WS PR-7b).
+    #[test]
+    fn source_parse_live() {
+        let prog = parse(lex("items <- source live db.q \"select 1\"\n").unwrap()).unwrap();
+        let Stmt::Assign { value, .. } = &prog[0] else {
+            panic!("Assign kutilgan");
+        };
+        assert!(
+            matches!(value, Expr::Source { live: true, .. }),
+            "live:true kutilgan"
         );
     }
 }

@@ -328,6 +328,13 @@ impl Interp {
                     .push(crate::serve_mod::PendingServer::Ui { port });
                 Ok(Value::Nil)
             }
+            // ui.invalidate :tag — source'ni qayta yuklash signali. PR-7a (stateless,
+            // WS yo'q): NO-OP — server client'ga push qila olmaydi. Source qayta
+            // bajarilishi client event re-render orqali bo'ladi (/_fx/event'da view
+            // QAYTA eval -> source qayta bajariladi). Tag-targeted WS broadcast +
+            // ui.push (barcha klientlar) = PR-7b. Bu yerda Nil qaytaradi (xato emas)
+            // — kod `ui.invalidate :items` yozsa parse/eval buzilmasin.
+            "invalidate" => Ok(Value::Nil),
             _ => Err(Flow::err(format!("ui.{} funksiyasi yo'q", func))),
         }
     }

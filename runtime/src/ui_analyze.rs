@@ -369,6 +369,25 @@ view list items
     }
 
     #[test]
+    fn source_bind_react() {
+        // `items <- source db.q ...` -> Assign -> React. `items.data` o'qilsa island.
+        let p = plan_of(
+            r#"
+view shop
+  items <- source db.q "select * from gul"
+  each g in items.data
+    p g.name
+"#,
+            "shop",
+        );
+        assert_eq!(p.binds.get("items"), Some(&BindKind::React));
+        assert!(
+            p.interactive,
+            "source .data o'qilsa interaktiv (reaktiv data) bo'lishi kerak"
+        );
+    }
+
+    #[test]
     fn parametr_immut() {
         // View parametri (prop) statik bo'lib o'qilsa interaktiv emas.
         let p = plan_of(

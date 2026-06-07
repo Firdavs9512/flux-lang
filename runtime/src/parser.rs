@@ -817,6 +817,7 @@ impl Parser {
             Tok::LBracket => self.parse_list(),
             Tok::LBrace => self.parse_map(),
             Tok::Backslash => self.parse_lambda(),
+            Tok::Source => self.parse_source(),
             Tok::If => self.parse_if(),
             Tok::Match => self.parse_match(),
             Tok::Fail => self.parse_fail_expr(),
@@ -932,6 +933,25 @@ impl Parser {
         self.no_app = saved;
         self.expect(&Tok::RBrace, "'}'")?;
         Ok(Expr::Map(entries))
+    }
+
+    // source [live] db.q "..."  — reaktiv data o'rovi (frontend). `source` keyword'dan
+    // keyin ixtiyoriy `live` modifikatori, so'ng backend chaqiruv (`db.q`/`http.get`)
+    // to'liq application sifatida o'qiladi. `live` PR-7a'da bayroq (WS PR-7b).
+    fn parse_source(&mut self) -> ParseResult<Expr> {
+        self.advance(); // source
+        // Ixtiyoriy `live` modifikatori (oddiy ident sifatida keladi).
+        let live = matches!(self.peek(), Tok::Ident(n) if n == "live");
+        if live {
+            self.advance(); // live
+        }
+        // Inner = to'liq qavssiz chaqiruv (`db.q "select ..."`). parse_application
+        // postfix + juxtaposition argumentlarni o'zi yig'adi.
+        let inner = self.parse_application()?;
+        Ok(Expr::Source {
+            inner: Box::new(inner),
+            live,
+        })
     }
 
     fn parse_lambda(&mut self) -> ParseResult<Expr> {
