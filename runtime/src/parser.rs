@@ -22,6 +22,11 @@ pub struct Parser {
     // application bosqichini o'chiradi, shunda `{a:f b:g}` da `f` `b`ni argument
     // sifatida yutmaydi. Chaqiruv kerak bo'lsa: `{a:(f x)}`.
     no_app: bool,
+    // `view` tanasi ichidamizmi. View ichida element-statementdan keyin kelgan
+    // indentatsiyalangan blok element BOLALARI sifatida o'qiladi (`div\n  h1 ..`).
+    // Backend kodida (oddiy `fn`) bu semantika YO'Q — shuning uchun bayroq bilan
+    // faqat view kontekstida yoqamiz.
+    in_view: bool,
 }
 
 pub type ParseResult<T> = Result<T, String>;
@@ -31,6 +36,7 @@ pub fn parse(toks: Vec<Token>) -> ParseResult<Program> {
         toks,
         pos: 0,
         no_app: false,
+        in_view: false,
     };
     p.parse_program()
 }
@@ -132,6 +138,7 @@ impl Parser {
     fn parse_stmt(&mut self) -> ParseResult<Stmt> {
         match self.peek() {
             Tok::Fn => self.parse_fn(false),
+            Tok::View => self.parse_view(),
             Tok::Exp => self.parse_exp(),
             Tok::If => Ok(Stmt::Expr(self.parse_if()?)),
             Tok::Match => Ok(Stmt::Expr(self.parse_match()?)),
@@ -221,6 +228,59 @@ impl Parser {
                 exported,
             })
         }
+    }
+
+    // view nom params... — fn'ning UI varianti. Parse'i `parse_fn` ga o'xshaydi,
+    // lekin tana element-daraxt rejimida (`in_view`) o'qiladi: bir qatorli `->`
+    // shakli YO'Q (view tanasi doim blok).
+    fn parse_view(&mut self) -> ParseResult<Stmt> {
+        self.advance(); // view
+        let name = self.expect_ident("view nomi")?;
+        let mut params = Vec::new();
+        while let Tok::Ident(_) = self.peek() {
+            let p = self.expect_ident("parametr")?;
+            if params.contains(&p) {
+                return Err(format!("'{}' view'ida takror parametr nomi: '{}'", name, p));
+            }
+            params.push(p);
+        }
+        self.expect(&Tok::Newline, "view tanasi")?;
+        let body = self.parse_view_block()?;
+        Ok(Stmt::ViewDecl { name, params, body })
+    }
+
+    // View tanasi/element bolalari uchun blok. `parse_block` kabi, lekin har
+    // statementdan keyin `Indent` kelsa — uni element BOLALARI deb o'qib, oldingi
+    // element-chaqiruvga oxirgi `List` argument sifatida qo'shadi (`div\n  h1 ..`).
+    fn parse_view_block(&mut self) -> ParseResult<Vec<Stmt>> {
+        let saved = self.in_view;
+        self.in_view = true;
+        self.expect(&Tok::Indent, "element bloki (chekinish)")?;
+        let mut stmts = Vec::new();
+        self.skip_newlines();
+        while !self.check(&Tok::Dedent) && !self.check(&Tok::Eof) {
+            let mut stmt = self.parse_stmt()?;
+            // Statement element-chaqiruv bo'lib, keyin yangi qator + chekinish
+            // kelsa — indentatsiyalangan blok shu element'ning bolalari.
+            if self.check(&Tok::Newline) && self.peek_after_newline_is_indent() {
+                self.advance(); // newline
+                let children = self.parse_view_block()?;
+                stmt = attach_children(stmt, children);
+            }
+            stmts.push(stmt);
+            self.skip_newlines();
+        }
+        self.expect(&Tok::Dedent, "element bloki oxiri")?;
+        self.in_view = saved;
+        Ok(stmts)
+    }
+
+    // Newline'dan keyingi token Indent ekanini tekshiradi (uni iste'mol qilmasdan).
+    fn peek_after_newline_is_indent(&self) -> bool {
+        matches!(
+            self.toks.get(self.pos + 1).map(|t| &t.tok),
+            Some(Tok::Indent)
+        )
     }
 
     fn parse_exp(&mut self) -> ParseResult<Stmt> {
@@ -685,6 +745,7 @@ impl Parser {
                         toks,
                         pos: 0,
                         no_app: false,
+                        in_view: false,
                     };
                     sub.skip_newlines();
                     let e = sub.parse_expr()?;
@@ -930,6 +991,39 @@ fn is_schema_type_name(name: &str) -> bool {
     matches!(name, "str" | "int" | "flt" | "bool" | "json" | "sym")
 }
 
+// Element bolalarini (indentatsiyalangan blok) element-chaqiruvga oxirgi
+// argument sifatida ulaydi. Bolalar `Stmt` ro'yxati Expr::List'ga aylantiriladi
+// (har statement Expr bo'lishi kerak — element-call). Element konstruktori
+// (`div`/`p`/...) bu oxirgi List argumentni `children` deb biladi (ui_mod).
+//
+// Agar statement element-chaqiruv bo'lmasa (masalan oddiy bind), bolalar baribir
+// List sifatida qo'shiladi — lekin amalda view ichida faqat elementlar bola oladi.
+fn attach_children(stmt: Stmt, children: Vec<Stmt>) -> Stmt {
+    // Bolalarni Expr ro'yxatiga aylantiramiz. MVP'da bolalar = element-call
+    // (Stmt::Expr). Element bo'lmagan statement (each/if/bind) bola sifatida —
+    // kelajak bosqich (2: each/if render); hozir e'tiborsiz qoldiriladi.
+    let child_exprs: Vec<Expr> = children
+        .into_iter()
+        .filter_map(|s| match s {
+            Stmt::Expr(e) => Some(e),
+            _ => None,
+        })
+        .collect();
+    let children_arg = Expr::List(child_exprs);
+    match stmt {
+        Stmt::Expr(Expr::Call { callee, mut args }) => {
+            args.push(children_arg);
+            Stmt::Expr(Expr::Call { callee, args })
+        }
+        // Argumentsiz element: `div\n  ...` -> Call{callee:div, args:[children]}
+        Stmt::Expr(callee @ Expr::Ident(_)) => Stmt::Expr(Expr::Call {
+            callee: Box::new(callee),
+            args: vec![children_arg],
+        }),
+        other => other,
+    }
+}
+
 fn keyword_as_name(tok: &Tok) -> Option<String> {
     let s = match tok {
         Tok::Ident(s) => return Some(s.clone()),
@@ -948,6 +1042,11 @@ fn keyword_as_name(tok: &Tok) -> Option<String> {
         Tok::As => "as",
         Tok::Tbl => "tbl",
         Tok::Fail => "fail",
+        Tok::View => "view",
+        Tok::Theme => "theme",
+        Tok::Page => "page",
+        Tok::Source => "source",
+        Tok::Act => "act",
         Tok::True => "true",
         Tok::False => "false",
         Tok::Nil => "nil",

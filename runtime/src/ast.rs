@@ -168,6 +168,14 @@ pub enum Stmt {
         exported: bool,
     },
 
+    // view nom params... — komponent e'loni (fn'ning UI varianti). Tana element
+    // daraxti; chaqirilganda {__node} qiymatlari yig'iladi. params = proplar.
+    ViewDecl {
+        name: String,
+        params: Vec<String>,
+        body: Vec<Stmt>,
+    },
+
     // each x in iter / each k, v in iter
     Each {
         vars: Vec<String>,

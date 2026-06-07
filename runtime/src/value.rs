@@ -33,6 +33,11 @@ pub enum Value {
 pub struct FnValue {
     pub params: Vec<String>,
     pub body: Vec<Stmt>,
+    // `view` (UI komponent) sifatida e'lon qilinganmi. Shunday bo'lsa, `apply`
+    // tana ichidagi BARCHA top-level element ({__node}) qiymatlarini yig'ib
+    // fragment qaytaradi (oddiy fn faqat oxirgi ifodani qaytaradi). false =
+    // oddiy backend funksiyasi.
+    pub is_view: bool,
     // Closure ota-havolasi. `apply` shundan child scope ochadi — top-level
     // fn'lar uchun bu `Parent::Root`, shuning uchun rekursiv chaqiruvda root
     // Arc klonlanmaydi/lock olinmaydi (atomik contention yo'q). Nested closure

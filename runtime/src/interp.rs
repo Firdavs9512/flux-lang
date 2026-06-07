@@ -347,13 +347,17 @@ impl Interp {
             match stmt {
                 Stmt::FnDecl {
                     name, params, body, ..
-                } => {
+                }
+                // view — fn'ning UI varianti: bir xil hoisting (Value::Fn), lekin
+                // is_view:true (apply fragment yig'adi). `ui.html` render qiladi.
+                | Stmt::ViewDecl { name, params, body } => {
                     let f = Value::Fn(Arc::new(FnValue {
                         params: params.clone(),
                         body: body.clone(),
-                        // Top-level fn — ota root (marker, Arc emas).
+                        // Top-level fn/view — ota root (marker, Arc emas).
                         parent: Parent::Root,
                         name: name.clone(),
+                        is_view: matches!(stmt, Stmt::ViewDecl { .. }),
                     }));
                     self.global.write().define(name, f, false);
                 }
@@ -362,8 +366,11 @@ impl Interp {
             }
         }
         for stmt in prog {
-            // fn/tbl allaqachon ro'yxatda — qayta bajarmaymiz.
-            if matches!(stmt, Stmt::FnDecl { .. } | Stmt::Tbl { .. }) {
+            // fn/view/tbl allaqachon ro'yxatda — qayta bajarmaymiz.
+            if matches!(
+                stmt,
+                Stmt::FnDecl { .. } | Stmt::ViewDecl { .. } | Stmt::Tbl { .. }
+            ) {
                 continue;
             }
             match self.exec_stmt(stmt, &self.global.clone()) {
@@ -514,12 +521,14 @@ impl Interp {
             match stmt {
                 Stmt::FnDecl {
                     name, params, body, ..
-                } => {
+                }
+                | Stmt::ViewDecl { name, params, body } => {
                     let f = Value::Fn(Arc::new(FnValue {
                         params: params.clone(),
                         body: body.clone(),
                         parent: Scope::parent_link(scope),
                         name: name.clone(),
+                        is_view: matches!(stmt, Stmt::ViewDecl { .. }),
                     }));
                     scope.write().define(name, f, false);
                 }
@@ -528,7 +537,10 @@ impl Interp {
             }
         }
         for stmt in prog {
-            if matches!(stmt, Stmt::FnDecl { .. } | Stmt::Tbl { .. }) {
+            if matches!(
+                stmt,
+                Stmt::FnDecl { .. } | Stmt::ViewDecl { .. } | Stmt::Tbl { .. }
+            ) {
                 continue;
             }
             match self.exec_stmt(stmt, scope) {
@@ -556,6 +568,32 @@ impl Interp {
         Ok(last)
     }
 
+    // View tanasi: oddiy blokdan farqli, BARCHA top-level element ({__node})
+    // qiymatlarini yig'adi (oxirgi-ifoda emas). Element bo'lmagan statementlar
+    // (bind, fn, har xil yon-effekt) bajariladi-yu, natijasi yig'ilmaydi.
+    //   - 0 element -> nil
+    //   - 1 element -> o'zi
+    //   - 2+ element -> {__node tag:"__fragment" children:[...]} (ko'rinmas o'rov)
+    // `ret` (erta qaytish) bo'lsa — o'sha qiymatni qaytaradi (guard-clause).
+    fn exec_view_body(&self, stmts: &[Stmt], env: &Env) -> ExecResult {
+        let mut nodes: Vec<Value> = Vec::new();
+        for s in stmts {
+            let v = match self.exec_stmt(s, env) {
+                Ok(v) => v,
+                Err(Flow::Return(v)) => return Ok(v),
+                Err(other) => return Err(other),
+            };
+            if crate::ui_mod::is_node_value(&v) {
+                nodes.push(v);
+            }
+        }
+        match nodes.len() {
+            0 => Ok(Value::Nil),
+            1 => Ok(nodes.into_iter().next().unwrap()),
+            _ => Ok(crate::ui_mod::fragment(nodes)),
+        }
+    }
+
     fn exec_stmt(&self, stmt: &Stmt, env: &Env) -> ExecResult {
         match stmt {
             Stmt::Bind { name, value } => {
@@ -576,12 +614,14 @@ impl Interp {
             }
             Stmt::FnDecl {
                 name, params, body, ..
-            } => {
+            }
+            | Stmt::ViewDecl { name, params, body } => {
                 let f = Value::Fn(Arc::new(FnValue {
                     params: params.clone(),
                     body: body.clone(),
                     parent: Scope::parent_link(env),
                     name: name.clone(),
+                    is_view: matches!(stmt, Stmt::ViewDecl { .. }),
                 }));
                 env.write().define(name, f, false);
                 Ok(Value::Nil)
@@ -981,6 +1021,7 @@ impl Interp {
                 body: body.clone(),
                 parent: Scope::parent_link(env),
                 name: "<lambda>".to_string(),
+                is_view: false,
             }))),
             Expr::Call { callee, args } => self.eval_call(callee, args, env),
             Expr::Try(inner) => {
@@ -1186,6 +1227,13 @@ impl Interp {
                     let argv = self.eval_args(args, env)?;
                     return self.arc_self().http_dispatch(name, argv);
                 }
+                // ui — frontend qatlami (UI render/serve). `ui.html` element
+                // daraxtini HTML'ga aylantiradi. State'li (kelajakda `ui.serve`)
+                // — Interp'ga muhtoj, shuning uchun ui_dispatch'ga yo'naltiramiz.
+                if modname == "ui" {
+                    let argv = self.eval_args(args, env)?;
+                    return self.arc_self().ui_dispatch(name, argv);
+                }
                 // db — http kabi state'li (connection + tx konteksti); Interp'ga
                 // muhtoj. db.tx argumenti lambda bo'lib keladi (Value::Fn).
                 if modname == "db" {
@@ -1255,6 +1303,18 @@ impl Interp {
                 }
             }
             return crate::builtins::call_method(&recv, name, argv);
+        }
+        // Element teg fallback: callee oddiy `Ident(tag)` bo'lib, o'zgaruvchi
+        // sifatida e'lon QILINMAGAN va element teg (div/p/h1/...) bo'lsa — element
+        // quramiz. Bu teglarni global o'zgaruvchi qilmaslik uchun (aks holda `a`,
+        // `p`, `form` kabi keng tarqalgan nomlar oddiy bind bilan to'qnashardi):
+        // teg faqat CHAQIRUV pozitsiyasida va nom band bo'lmaganda hal qilinadi.
+        if let Expr::Ident(tag) = callee
+            && crate::ui_mod::is_element_tag(tag)
+            && self.lookup(tag, env).is_err()
+        {
+            let argv = self.eval_args(args, env)?;
+            return crate::ui_mod::build_element(tag, argv);
         }
         let f = self.eval(callee, env)?;
         let argv = self.eval_args(args, env)?;
@@ -1353,6 +1413,12 @@ impl Interp {
                         // Params kichik (0-4), O(n²) arzon. Mutable: tana `<-` qila oladi.
                         s.define(p, a, true);
                     }
+                }
+                if fv.is_view {
+                    // View: tana ichidagi BARCHA top-level element ({__node})
+                    // qiymatlarini yig'amiz. Bittasi bo'lsa — o'zini; bir nechta
+                    // bo'lsa — fragment ichiga o'rab qaytaramiz (oxirgi-ifoda emas).
+                    return self.exec_view_body(&fv.body, &call_env);
                 }
                 match self.exec_block(&fv.body, &call_env) {
                     Ok(v) => Ok(v),                // oxirgi ifoda — qaytadi

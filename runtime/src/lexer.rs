@@ -370,6 +370,12 @@ impl<'a> Lexer<'a> {
             "as" => Tok::As,
             "tbl" => Tok::Tbl,
             "fail" => Tok::Fail,
+            // Frontend (UI qatlami) kalit so'zlari
+            "view" => Tok::View,
+            "theme" => Tok::Theme,
+            "page" => Tok::Page,
+            "source" => Tok::Source,
+            "act" => Tok::Act,
             _ => Tok::Ident(s),
         };
         self.push_at(tok, line, col);

@@ -34,6 +34,12 @@ pub enum Tok {
     As,
     Tbl,
     Fail,
+    // Frontend kalit so'zlari (UI qatlami)
+    View,   // view nom params... (fn'ning UI varianti)
+    Theme,  // theme bloki (dizayn tokenlari)
+    Page,   // page "/yo'l" -> view (routing)
+    Source, // source db.q "..." (reaktiv data)
+    Act,    // act nom (view-ichi handler, state'ga yetadi)
 
     // Operatorlar va punktuatsiya
     Eq,        // =

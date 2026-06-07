@@ -23,6 +23,7 @@ mod queue_mod;
 mod reg_mod;
 mod serve_mod;
 mod token;
+mod ui_mod;
 mod value;
 mod ws_mod;
 
@@ -1268,6 +1269,51 @@ s = :florist
         run(r#"
 xs = [:a "b"]
 ((str.str xs) == "[:a \"b\"]") | (fail "list repr: ${str.str xs}")
+"#);
+    }
+
+    // --- Frontend (UI qatlami) — 1-BOSQICH testlari ---
+
+    // view + ui.html: ko'p elementli tana fragmentga yig'iladi (interpolatsiya ham).
+    #[test]
+    fn view_html_render() {
+        run(r#"
+view greeting name
+  h1 "Salom $name"
+  p "xush kelibsiz"
+
+out = ui.html (greeting "Ali")
+(out == "<h1>Salom Ali</h1><p>xush kelibsiz</p>") | (fail "render xato: ${out}")
+"#);
+    }
+
+    // Element bolalari (indentatsiya) + semantik proplar -> class.
+    #[test]
+    fn view_nested_va_proplar() {
+        run(r#"
+view card title price
+  div {kind::panel pad:4}
+    h2 title
+    p "${price} so'm" {kind::muted}
+    btn "Sotib olish" {kind::primary}
+
+out = ui.html (card "Atirgul" 50000)
+(str.has out "<div class=\"flux-panel flux-pad-4\">") | (fail "panel class yo'q: ${out}")
+(str.has out "<h2>Atirgul</h2>") | (fail "h2 yo'q: ${out}")
+(str.has out "<p class=\"flux-muted\">50000 so'm</p>") | (fail "muted p yo'q: ${out}")
+(str.has out "<button class=\"flux-primary\">Sotib olish</button>") | (fail "btn yo'q: ${out}")
+"#);
+    }
+
+    // Matn escape qilinadi (XSS himoyasi).
+    #[test]
+    fn view_matn_escape() {
+        run(r#"
+view danger
+  p "a < b & c > d"
+
+out = ui.html (danger())
+(out == "<p>a &lt; b &amp; c &gt; d</p>") | (fail "escape xato: ${out}")
 "#);
     }
 }
