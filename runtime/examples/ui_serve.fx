@@ -1,11 +1,15 @@
-# Flux Frontend — 3-BOSQICH misoli: page routing + ui.serve (SSR).
+# Flux Frontend — 3+5a BOSQICH misoli: page routing + ui.serve + interaktivlik.
 #
 # `page "/yo'l" -> view` URL'ni view'ga bog'laydi. `ui.serve port` bitta portda
-# HTML sahifa (page) + REST API (http.on) beradi. Brauzer http://localhost:3777/
-# ochsa SSR HTML (theme CSS bilan) keladi.
+# HTML sahifa (page) + REST API (http.on) + /_fx/event (server-driven) beradi.
+#
+# AVTOMATIK AJRATISH: `home` da `q <- ""` + `bind:q` bor -> qidiruv qismi CLIENT
+# ISLAND (interaktiv, jonli filtr server-driven), qolgani SOF SSR (0 JS, statik).
+# Dasturchi hech narsa belgilamaydi — analyzer o'zi aniqlaydi.
 #
 # DIQQAT: bu fayl portni ochib BLOKLAYDI (server) — smoke-test uchun emas.
-# Ishga tushirish: cargo run -- run examples/ui_serve.fx, keyin brauzerda och.
+# Ishga tushirish: cargo run -- run examples/ui_serve.fx, keyin brauzerda och,
+# qidiruv maydoniga yoz -> ro'yxat jonli filtrlanadi (server-driven, RAM'siz).
 
 theme
   primary "#e84d8a"
@@ -13,11 +17,14 @@ theme
   muted   "#888"
 
 view home
+  q <- ""
   h1 "Gulzor"
   p "Eng yaxshi gullar shu yerda" {kind::muted}
-  each g in ["Atirgul" "Lola" "Chinnigul"]
-    div {kind::panel}
-      h2 g
+  div {kind::panel}
+    input {bind:q placeholder:"Gul qidir..."}
+    each g in ["Atirgul" "Lola" "Chinnigul" "Nilufar"]
+      if str.has (str.low g) (str.low q)
+        h2 g
 
 # 1-param view — req (params/query) oladi.
 view product req

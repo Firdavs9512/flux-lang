@@ -1462,6 +1462,59 @@ doc = ui.page (shop())
 "##);
     }
 
+    // PR-5a: element ICHIDA each+if (div > each > if > p) to'liq render.
+    #[test]
+    fn element_ichida_each_if() {
+        run(r#"
+view shop
+  div {kind::panel}
+    each g in ["atirgul" "lola"]
+      if str.has g "la"
+        p g
+
+out = ui.html (shop())
+(out == "<div class=\"flux-panel\"><p>lola</p></div>") | (fail "element-each-if xato: ${out}")
+"#);
+    }
+
+    // PR-5a: server-driven island re-render (jonli filtr). Client q="lo" yuboradi,
+    // server view'ni shu state bilan re-render qilib faqat island HTML qaytaradi.
+    #[test]
+    fn fx_event_island_re_render() {
+        let src = r#"
+view shop
+  q <- ""
+  div {kind::panel}
+    input {bind:q}
+    each item in ["atirgul" "lola" "chinnigul"]
+      if str.has item q
+        p item
+
+page "/" -> shop
+"#;
+        let toks = lexer::lex(src).expect("lex");
+        let prog = parser::parse(toks).expect("parse");
+        let interp = interp::Interp::new_arc();
+        interp.run(&prog).expect("run");
+        // Client q="lo" yuboradi -> server faqat "lola" qaytarishi kerak.
+        let body = br#"{"page":"/","island":1,"event":"input","handler":"q","state":{"q":"lo"}}"#;
+        let html = match ui_mod::fx_event_render(&interp, body) {
+            Ok(h) => h,
+            Err(_) => panic!("fx_event_render xato qaytardi"),
+        };
+        assert!(html.contains("<p>lola</p>"), "lola yo'q: {}", html);
+        assert!(
+            !html.contains("atirgul"),
+            "filtr ishlamadi (atirgul bor): {}",
+            html
+        );
+        assert!(
+            html.contains("data-fx-island=\"1\""),
+            "island marker yo'q: {}",
+            html
+        );
+    }
+
     // PR-4b: sof statik sahifa 0 JS (CDN-cacheable invariant).
     #[test]
     fn sof_statik_nol_js() {

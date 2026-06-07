@@ -241,6 +241,9 @@ fn expr_has_interactivity(e: &Expr, binds: &HashMap<String, BindKind>) -> bool {
                     .iter()
                     .any(|arm| body_has_interactivity(&arm.body, binds))
         }
+        // Element bolalari bloki — ichidagi statementlarni (each/if/element)
+        // interaktivlik izi uchun tekshiramiz (div ichida `each ... on:`).
+        Expr::Children(stmts) => body_has_interactivity(stmts, binds),
         _ => false,
     }
 }

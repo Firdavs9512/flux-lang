@@ -78,6 +78,12 @@ pub enum Expr {
     },
     // inf — cheksiz iterator. Faqat `each i in inf` da ma'noli (i = 0,1,2,...).
     Inf,
+
+    // Element bolalari bloki (view ichida indentatsiyadan): `div\n  each ..\n  p ..`.
+    // Statement ro'yxati sifatida saqlanadi (Expr::List EMAS), shunda render
+    // vaqtida `collect_view_nodes` `each`/`if`/`match`ni kengaytira oladi (element
+    // ichida ro'yxat/shartli render). build_node bu argumentni children deb biladi.
+    Children(Vec<Stmt>),
 }
 
 #[derive(Debug, Clone)]

@@ -227,6 +227,31 @@ fn children_interactive(node: &BTreeMap<String, Value>) -> bool {
     children.iter().any(node_interactive)
 }
 
+// `__island == target` bo'lgan node'ni daraxtdan topadi (re-render uchun).
+fn find_island(node: &Value, target: i64) -> Option<&Value> {
+    let Value::Map(m) = node else {
+        return None;
+    };
+    if let Some(Value::Int(id)) = m.get("__island")
+        && *id == target
+    {
+        return Some(node);
+    }
+    if let Some(Value::List(children)) = m.get("children") {
+        for c in children {
+            if let Some(found) = find_island(c, target) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+// Client runtime JS (PR-5a) — /_fx/client.js da beriladi. include_str! bilan
+// crate ichida (ai_mod $AI_KEY env-resurs naqshi). Faqat island bor sahifaga
+// yuklanadi (window.__fx mavjud bo'lsa client o'zini ishga tushiradi).
+pub const CLIENT_JS: &str = include_str!("ui_client.js");
+
 // Node (yoki uning subtree'si) interaktivmi (on:/bind: izi bor).
 fn node_interactive(v: &Value) -> bool {
     let Value::Map(m) = v else {
@@ -320,8 +345,8 @@ const BASE_CSS: &str = "\
 // island_count > 0 bo'lsa body oxiriga `window.__fx` bootstrap script qo'shiladi
 // (PR-4b minimal: island ro'yxati + mode; PR-5 to'ldiradi). 0 island = 0 JS
 // (sof statik sahifa CDN-cacheable).
-fn full_document(css: &str, body_html: &str, island_count: u32) -> String {
-    let script = fx_bootstrap_script(island_count);
+fn full_document(css: &str, body_html: &str, island_count: u32, path: &str) -> String {
+    let script = fx_bootstrap_script(island_count, path);
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
@@ -330,9 +355,10 @@ fn full_document(css: &str, body_html: &str, island_count: u32) -> String {
     )
 }
 
-// PR-4b minimal bootstrap: island ro'yxati + mode (HAL QILINGAN QARORLAR:
-// hammasi server-driven). 0 island = script YO'Q (sof statik, 0 JS).
-fn fx_bootstrap_script(island_count: u32) -> String {
+// PR-5a bootstrap: window.__fx (page + island ro'yxati + mode) + client.js yuklash.
+// `page` — client /_fx/event POST'da qaytaradi (server qaysi view ekanini biladi,
+// stateless). 0 island = script YO'Q (sof statik, 0 JS — CDN-cacheable invariant).
+fn fx_bootstrap_script(island_count: u32, path: &str) -> String {
     if island_count == 0 {
         return String::new();
     }
@@ -344,7 +370,9 @@ fn fx_bootstrap_script(island_count: u32) -> String {
         islands.push_str(&format!("\"{}\":{{\"mode\":\"server\"}}", i));
     }
     format!(
-        "<script>window.__fx={{\"islands\":{{{}}}}}</script>",
+        "<script>window.__fx={{\"page\":\"{}\",\"islands\":{{{}}}}}</script>\
+<script src=\"/_fx/client.js\"></script>",
+        escape_attr(path),
         islands
     )
 }
@@ -403,6 +431,20 @@ async fn ui_handle_request(
     let path = uri.path().to_string();
     let query = uri.query().unwrap_or("").to_string();
 
+    // 0) Maxsus /_fx/* yo'llari (frontend runtime) — boshqa hammasidan oldin.
+    // /_fx/client.js — universal client JS (statik, keshlanadigan).
+    if method == "get" && path == "/_fx/client.js" {
+        return Ok(js_response(crate::ui_mod::CLIENT_JS));
+    }
+    // /_fx/event — island re-render (PR-5a, server-driven, stateless POST).
+    if method == "post" && path == "/_fx/event" {
+        let body_bytes = match req.into_body().collect().await {
+            Ok(c) => c.to_bytes(),
+            Err(_) => Bytes::new(),
+        };
+        return Ok(handle_fx_event(interp, &body_bytes).await);
+    }
+
     // Sarlavhalar (http_mod naqshi: lowercase, '-' -> '_').
     let mut headers = BTreeMap::new();
     let mut is_json = false;
@@ -444,6 +486,9 @@ async fn ui_handle_request(
         Ok(c) => c.to_bytes(),
         Err(_) => Bytes::new(),
     };
+    // Page render uchun path'ni saqlaymiz (build_req uni move qiladi) — client
+    // /_fx/event POST'da shu path'ni qaytaradi (qaysi view re-render bo'lishi).
+    let page_path = path.clone();
     let request_value =
         crate::http_mod::build_req(method, path, query, headers, params, body_bytes, is_json);
     let handler = route.handler;
@@ -464,7 +509,7 @@ async fn ui_handle_request(
         // page bo'lsa shu thread'da HTML render qilamiz (theme o'qish ham bu yerda),
         // REST bo'lsa xom Value qaytaramiz (tashqarida value_to_response).
         if is_page {
-            Ok(PageOrRest::Page(interp2.render_page(&v)))
+            Ok(PageOrRest::Page(interp2.render_page_at(&v, &page_path)))
         } else {
             Ok(PageOrRest::Rest(v))
         }
@@ -509,6 +554,90 @@ fn html_response(html: &str) -> Response<Full<Bytes>> {
         .unwrap()
 }
 
+// JS javob (statik client.js — keshlanadigan).
+fn js_response(js: &str) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(200)
+        .header("content-type", "application/javascript; charset=utf-8")
+        .header("cache-control", "public, max-age=3600")
+        .body(Full::new(Bytes::from(js.to_string())))
+        .unwrap()
+}
+
+// /_fx/event — island re-render (PR-5a, server-driven, stateless).
+// POST tanasi: {page, island, event, handler, state}. Oqim: page handler'ni
+// client state seed bilan re-render -> island N node'ini topib HTML qaytarish.
+// Faqat STATE-DRIVEN (bind:) — handler-effekt (on:) PR-6 (handler tanasi kerak).
+async fn handle_fx_event(interp: Arc<Interp>, body: &[u8]) -> Response<Full<Bytes>> {
+    let body = body.to_vec();
+    let result = tokio::task::spawn_blocking(move || fx_event_render(&interp, &body)).await;
+    match result {
+        Ok(Ok(html)) => html_response(&html),
+        Ok(Err(flow)) => crate::http_mod::json_response(
+            500,
+            format!("{{\"error\":\"{}\"}}", flow_message(&flow)),
+        ),
+        Err(e) => {
+            crate::http_mod::json_response(500, format!("{{\"error\":\"event panic: {}\"}}", e))
+        }
+    }
+}
+
+// Event JSON'ni parse qilib island'ni client state ostida re-render qiladi.
+// Sinxron (spawn_blocking ichida chaqiriladi). pub(crate): integratsiya testi
+// async serverni ochmasdan to'g'ridan chaqiradi.
+pub(crate) fn fx_event_render(interp: &Arc<Interp>, body: &[u8]) -> Result<String, Flow> {
+    let s = String::from_utf8_lossy(body);
+    let payload = crate::builtins::json_decode(&s)
+        .map_err(|e| Flow::err(format!("/_fx/event JSON parse: {}", flow_message(&e))))?;
+    let Value::Map(m) = payload else {
+        return Err(Flow::err("/_fx/event: JSON obyekt kutilgan"));
+    };
+    // page (qaysi view), island (qaysi qism), state (client React state'i).
+    let page = match m.get("page") {
+        Some(Value::Str(p)) => p.clone(),
+        _ => "/".to_string(),
+    };
+    let island_id = match m.get("island") {
+        Some(Value::Str(s)) => s.parse::<i64>().unwrap_or(0),
+        Some(Value::Int(n)) => *n,
+        _ => 0,
+    };
+    let client_state = match m.get("state") {
+        Some(Value::Map(st)) => st.clone(),
+        _ => BTreeMap::new(),
+    };
+
+    // page bo'yicha handler topish (pages route'lari, GET).
+    let matched = {
+        let pages = interp.pages.lock().unwrap();
+        crate::http_mod::match_route(&pages, "get", &page)
+    };
+    let (route, _params) =
+        matched.ok_or_else(|| Flow::err(format!("/_fx/event: page topilmadi: {}", page)))?;
+
+    // Client state'ni seed qilib view'ni re-render qilamiz (guard panic-safe tozalaydi).
+    let _guard = crate::interp::FxRenderGuard::set(client_state);
+    let args = if interp.fn_arity(&route.handler) == Some(0) {
+        vec![]
+    } else {
+        // page handler req kutsa — minimal bo'sh req (PR-5a: state seed orqali).
+        vec![Value::Map(BTreeMap::new())]
+    };
+    let mut tree = interp.apply(route.handler, args)?;
+
+    // Island markerlar (SSR bilan bir xil tartibda) -> island N node'ini topamiz.
+    let mut next_id = 1u32;
+    mark_islands(&mut tree, &mut next_id);
+    match find_island(&tree, island_id) {
+        Some(node) => Ok(node_to_html(node)),
+        None => Err(Flow::err(format!(
+            "/_fx/event: island {} topilmadi",
+            island_id
+        ))),
+    }
+}
+
 impl Interp {
     // Funksiya qiymatining parametr sonini qaytaradi (Value::Fn). Native yoki
     // boshqa qiymat uchun None (arity noma'lum -> req beriladi).
@@ -520,8 +649,9 @@ impl Interp {
     }
 
     // page handler natijasini (element daraxti) to'liq HTML hujjatga aylantiradi
-    // (theme CSS + body). ui.page bilan bir xil, lekin serve_loop ichidan.
-    pub fn render_page(&self, node: &Value) -> String {
+    // (theme CSS + body + island markerlar + window.__fx). `path` — joriy URL
+    // (client /_fx/event POST'ida qaytaradi, server qaysi view ekanini biladi).
+    pub fn render_page_at(&self, node: &Value, path: &str) -> String {
         // Island markerlar (PR-4b) — node clone'iga qo'shamiz (kiruvchi o'zgarmaydi).
         let mut node = node.clone();
         let mut next_id = 1u32;
@@ -530,7 +660,12 @@ impl Interp {
             let theme = self.theme.read();
             theme_to_css(&theme)
         };
-        full_document(&css, &node_to_html(&node), island_count)
+        full_document(&css, &node_to_html(&node), island_count, path)
+    }
+
+    // ui.page (qo'lda render) — path noma'lum, "/" default.
+    pub fn render_page(&self, node: &Value) -> String {
+        self.render_page_at(node, "/")
     }
 }
 
@@ -873,11 +1008,26 @@ mod tests {
     }
 
     #[test]
+    fn find_island_topadi() {
+        // div(island 1) ichida btn — find_island(1) div'ni qaytaradi.
+        let btn = props_node("btn", vec![("on", Value::Str("go".into()))], Some("B"));
+        let mut div = node("div", vec![Value::List(vec![btn])]);
+        let mut id = 1;
+        mark_islands(&mut div, &mut id);
+        let found = find_island(&div, 1).expect("island 1 topilishi kerak");
+        let html = node_to_html(found);
+        assert!(html.contains("data-fx-island=\"1\""), "html: {}", html);
+        assert!(find_island(&div, 99).is_none(), "yo'q island None");
+    }
+
+    #[test]
     fn bootstrap_script_island_bilan() {
-        assert_eq!(fx_bootstrap_script(0), "", "0 island -> script yo'q");
-        let s = fx_bootstrap_script(2);
+        assert_eq!(fx_bootstrap_script(0, "/"), "", "0 island -> script yo'q");
+        let s = fx_bootstrap_script(2, "/shop");
         assert!(s.contains("window.__fx"), "s: {}", s);
+        assert!(s.contains("\"page\":\"/shop\""), "page yo'q: {}", s);
         assert!(s.contains("\"1\":{\"mode\":\"server\"}"), "s: {}", s);
         assert!(s.contains("\"2\":{\"mode\":\"server\"}"), "s: {}", s);
+        assert!(s.contains("/_fx/client.js"), "client.js yo'q: {}", s);
     }
 }

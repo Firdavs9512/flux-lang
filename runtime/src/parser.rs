@@ -1090,17 +1090,12 @@ fn is_schema_type_name(name: &str) -> bool {
 // Agar statement element-chaqiruv bo'lmasa (masalan oddiy bind), bolalar baribir
 // List sifatida qo'shiladi — lekin amalda view ichida faqat elementlar bola oladi.
 fn attach_children(stmt: Stmt, children: Vec<Stmt>) -> Stmt {
-    // Bolalarni Expr ro'yxatiga aylantiramiz. MVP'da bolalar = element-call
-    // (Stmt::Expr). Element bo'lmagan statement (each/if/bind) bola sifatida —
-    // kelajak bosqich (2: each/if render); hozir e'tiborsiz qoldiriladi.
-    let child_exprs: Vec<Expr> = children
-        .into_iter()
-        .filter_map(|s| match s {
-            Stmt::Expr(e) => Some(e),
-            _ => None,
-        })
-        .collect();
-    let children_arg = Expr::List(child_exprs);
+    // Bolalar Stmt bloki sifatida (Expr::Children) — element-call'ga oxirgi
+    // argument. Render vaqtida collect_view_nodes ularni kengaytiradi, shunda
+    // `each`/`if`/`match` element ICHIDA ham ro'yxat/shartli render qiladi
+    // (`div\n  each x in xs\n    p x`). build_node Children argumentini bolalar
+    // deb biladi.
+    let children_arg = Expr::Children(children);
     match stmt {
         Stmt::Expr(Expr::Call { callee, mut args }) => {
             args.push(children_arg);

@@ -15,6 +15,38 @@ use parking_lot::RwLock;
 use crate::ast::*;
 use crate::value::{FnValue, Value};
 
+// PR-5a: island re-render uchun client'dan kelgan state "seed". `/_fx/event`
+// so'rovida o'rnatiladi; view render'da reaktiv (`<-`) initial bind qiymatini shu
+// yerdan oladi (STATELESS: client = haqiqat manbai). thread_local — har request
+// alohida spawn_blocking thread'da, izolyatsiya tabiiy; Interp Arc o'zgarmaydi
+// (Send+Sync saqlanadi). Oddiy server render'da (page GET) None — ta'sir yo'q.
+thread_local! {
+    static FX_RENDER_STATE: std::cell::RefCell<Option<BTreeMap<String, Value>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+// Render seed'ni o'rnatadi va scope tugaganda (drop'da, panic'da ham) tozalaydi.
+// `/_fx/event` handler shu guard bilan view'ni client state ostida render qiladi.
+pub struct FxRenderGuard;
+
+impl FxRenderGuard {
+    pub fn set(state: BTreeMap<String, Value>) -> Self {
+        FX_RENDER_STATE.with(|c| *c.borrow_mut() = Some(state));
+        FxRenderGuard
+    }
+}
+
+impl Drop for FxRenderGuard {
+    fn drop(&mut self) {
+        FX_RENDER_STATE.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+// Render seed'da `name` bo'lsa uning qiymatini qaytaradi (reaktiv initial override).
+fn fx_seed_value(name: &str) -> Option<Value> {
+    FX_RENDER_STATE.with(|c| c.borrow().as_ref().and_then(|m| m.get(name).cloned()))
+}
+
 // Lexical scope: ota-muhitga havola bilan zanjir. Arc<RwLock<>> — closure'lar,
 // mutatsiya VA thread'lar orasida ulashish uchun (haqiqiy parallel HTTP).
 // RwLock (Mutex emas): qidirish/o'qish ko'p o'quvchiga parallel ruxsat beradi,
@@ -761,7 +793,13 @@ impl Interp {
                 Ok(Value::Nil)
             }
             Stmt::Assign { name, value } => {
-                let v = self.eval(value, env)?;
+                // PR-5a: island re-render'da reaktiv (`<-`) initial qiymatini
+                // client state'dan olamiz (seed bo'lsa). `q <- ""` -> q = "atir"
+                // (client yuborgan). Oddiy render'da seed None -> eval qiymati.
+                let v = match fx_seed_value(name) {
+                    Some(seeded) => seeded,
+                    None => self.eval(value, env)?,
+                };
                 self.assign(name, v, env)?;
                 Ok(Value::Nil)
             }
@@ -1157,6 +1195,14 @@ impl Interp {
             Expr::Inf => Err(Flow::err(
                 "inf faqat `each i in inf` da ishlatiladi (qiymat emas)",
             )),
+            // Element bolalari bloki — collect_view_nodes bilan kengaytiriladi
+            // (each/if/match ichidagi elementlar yig'iladi) va Value::List qaytadi.
+            // build_node uni children sifatida oladi.
+            Expr::Children(stmts) => {
+                let mut nodes: Vec<Value> = Vec::new();
+                self.collect_view_nodes(stmts, env, &mut nodes)?;
+                Ok(Value::List(nodes))
+            }
             Expr::Field { target, name } => {
                 // `env.PORT` — muhit o'zgaruvchisi. `env` built-in ident bo'lib,
                 // o'zgaruvchi sifatida e'lon QILINMAGAN bo'lsa, std::env'dan o'qiymiz.
