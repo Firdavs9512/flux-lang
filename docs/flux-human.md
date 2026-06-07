@@ -853,7 +853,14 @@ time.ago 24 :hr        # the time 24 units ago. Units: :sec :min :hr :day
 time.in  60 :min       # the time 60 units later (TTL/expiry). Same units
 time.fmt t "..."       # format a timestamp into text
 time.sleep 1           # waits 1 second (flt too — 0.5). Polling/retry backoff
+time.parse "2026-06-10T10:00:00Z"   # arbitrary ISO text -> canonical UTC timestamp ("Z"/"±HH:MM")
+time.add t 30 :min     # offset from ANY timestamp (not now): end_at = start_at + duration
+time.sub t 5 :min      # mirror of time.add — shift backward (e.g. buffer before)
+time.diff a b          # (a - b) difference in seconds (int); / 60 -> minutes
 ```
+> Difference between `time.in`/`time.ago` (offset from **now**) and
+> `time.add`/`time.sub` (offset from **any** given timestamp): a booking server
+> computes `end_at = time.add start_at 30 :min` from a client-supplied `start_at`.
 > Instead of writing raw `now() - interval '24 hours'` in a DB query, use
 > `time.ago` — it is clean and safe:
 > ```flux

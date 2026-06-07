@@ -416,6 +416,32 @@ sy = str.int (time.fmt soon "YYYYMMDDHHmmss")
     }
 
     #[test]
+    fn time_parse_add_diff_booking_flow() {
+        // Issue #65: mijoz ISO `start_at` va `duration_minutes` beradi ->
+        // server `end_at` ni hisoblaydi. Booking yadrosining e2e ssenariysi.
+        run(r#"
+start_at = time.parse "2026-06-10T10:00:00Z"
+(start_at == "2026-06-10 10:00:00") | (fail "parse noto'g'ri: ${start_at}")
+end_at = time.add start_at 30 :min
+(end_at == "2026-06-10 10:30:00") | (fail "add noto'g'ri: ${end_at}")
+mins = (time.diff end_at start_at) / 60
+(mins == 30) | (fail "diff noto'g'ri: ${mins}")
+# buffer-inclusive interval: start - 5min (time.sub — add ning ko'zgusi)
+buf_start = time.sub start_at 5 :min
+(buf_start == "2026-06-10 09:55:00") | (fail "time.sub noto'g'ri: ${buf_start}")
+"#);
+    }
+
+    #[test]
+    fn time_parse_handles_iso_offset() {
+        // ISO mintaqali matn UTC ga keltiriladi (+05:00 -> vaqt 5 soat oldin).
+        run(r#"
+t = time.parse "2026-06-10T15:00:00+05:00"
+(t == "2026-06-10 10:00:00") | (fail "mintaqa UTC ga kelmadi: ${t}")
+"#);
+    }
+
+    #[test]
     fn keyword_as_field_name() {
         // `.` dan keyin kalit so'z field nomi bo'la oladi (time.in shu tufayli ishlaydi).
         // Map kaliti kalit so'z bo'lsa ham `.in`/`.match` bilan o'qiladi — bu Flux

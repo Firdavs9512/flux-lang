@@ -850,7 +850,14 @@ time.ago 24 :hr        # 24 birlik oldingi vaqt. Birlik: :sec :min :hr :day
 time.in  60 :min       # 60 birlik keyingi vaqt (TTL/expiry). Birlik bir xil
 time.fmt t "..."       # timestamp'ni matnga formatlash
 time.sleep 1           # 1 soniya kutadi (flt ham — 0.5). Polling/retry backoff
+time.parse "2026-06-10T10:00:00Z"   # ixtiyoriy ISO matn -> kanonik UTC timestamp ("Z"/"±HH:MM")
+time.add t 30 :min     # IXTIYORIY vaqtdan offset (now emas): end_at = start_at + davomiylik
+time.sub t 5 :min      # time.add ko'zgusi — orqaga siljitadi (masalan buffer before)
+time.diff a b          # (a - b) farq sekundda (int); / 60 -> daqiqa
 ```
+> `time.in`/`time.ago` (**hozirdan** offset) bilan `time.add`/`time.sub`
+> (**ixtiyoriy** berilgan vaqtdan offset) farqi: booking server mijoz bergan
+> `start_at` dan `end_at = time.add start_at 30 :min` ni hisoblaydi.
 > DB so'rovida raw `now() - interval '24 hours'` yozish o'rniga `time.ago`
 > ishlating — toza va xavfsiz:
 > ```flux
