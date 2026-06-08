@@ -230,23 +230,66 @@ fn time_module(func: &str, args: Vec<Value>) -> R {
             Ok(Value::Nil)
         }
         // time.fmt timestamp "..." -> matn formatlash.
-        // Kirish: matn timestamp ("YYYY-MM-DD HH:MM:SS") yoki unix int.
+        // Kirish: matn timestamp ("YYYY-MM-DD HH:MM:SS", ISO mintaqa ham) yoki unix int.
         // Token'lar: YYYY MM DD HH mm ss
         "fmt" => {
-            let ts = match arg(&args, 0, "time.fmt")? {
-                Value::Str(s) => parse_ts(s).ok_or_else(|| {
-                    Flow::err(format!("time.fmt: timestamp matnini o'qib bo'lmadi: {}", s))
-                })?,
-                Value::Int(n) => *n,
-                other => {
-                    return Err(Flow::err(format!(
-                        "time.fmt: 1-argument timestamp (str/int) bo'lishi kerak, {} berildi",
-                        other.type_name()
-                    )));
-                }
-            };
+            let ts = arg_ts(&args, 0, "time.fmt")?;
             let pat = arg_str(&args, 1, "time.fmt")?;
             Ok(Value::Str(strftime(ts, &pat)))
+        }
+        // time.parse "2026-06-10T10:00:00Z" -> kanonik UTC matn timestamp.
+        // Ixtiyoriy ISO-8601 matnni (mijoz/tashqi API bergan) ichki kanonik
+        // "YYYY-MM-DD HH:MM:SS" UTC formatiga keltiradi — shunda time.add/time.diff
+        // va DB filtrlari u bilan bevosita ishlaydi. "Z", "±HH:MM"/"±HHMM" mintaqa
+        // va kasr sekundni tushunadi; mintaqasiz matn UTC deb qabul qilinadi.
+        "parse" => {
+            let s = arg_str(&args, 0, "time.parse")?;
+            let ts = parse_iso(&s).ok_or_else(|| {
+                Flow::err(format!(
+                    "time.parse: ISO timestamp matnini o'qib bo'lmadi: {}",
+                    s
+                ))
+            })?;
+            Ok(Value::Str(fmt_unix(ts)))
+        }
+        // time.add t N :birlik -> t timestamp'ga N birlik QO'SHIB UTC matn qaytaradi.
+        // time.in dan farqi: hozirdan emas, IXTIYORIY berilgan vaqtdan offset hisoblaydi
+        // (masalan end_at = start_at + duration). N manfiy bo'lsa ayiradi (orqaga siljitadi).
+        "add" => {
+            let base = arg_ts(&args, 0, "time.add")?;
+            let n = arg_int(&args, 1, "time.add")?;
+            let unit = arg_str(&args, 2, "time.add")?;
+            let secs = unit_secs(&unit).ok_or_else(|| {
+                Flow::err(format!(
+                    "time.add: birlik :sec/:min/:hr/:day bo'lishi kerak, :{} berildi",
+                    unit
+                ))
+            })?;
+            Ok(Value::Str(fmt_unix(base + n * secs)))
+        }
+        // time.sub t N :birlik -> t timestamp'dan N birlik AYIRIB UTC matn qaytaradi.
+        // time.add ning ko'zgusi (time.ago/time.in juftligi kabi). Qavssiz chaqiruvda
+        // manfiy son binar `-` bilan adashishini oldini olish uchun alohida funksiya —
+        // buffer-inclusive interval boshi `time.sub start_at 5 :min` deb yoziladi.
+        "sub" => {
+            let base = arg_ts(&args, 0, "time.sub")?;
+            let n = arg_int(&args, 1, "time.sub")?;
+            let unit = arg_str(&args, 2, "time.sub")?;
+            let secs = unit_secs(&unit).ok_or_else(|| {
+                Flow::err(format!(
+                    "time.sub: birlik :sec/:min/:hr/:day bo'lishi kerak, :{} berildi",
+                    unit
+                ))
+            })?;
+            Ok(Value::Str(fmt_unix(base - n * secs)))
+        }
+        // time.diff a b -> (a - b) ikki vaqt orasidagi farq SEKUNDDA (int).
+        // Musbat natija = a, b dan keyin (kelajakda). Birlikka bo'lib o'tiladi
+        // (masalan `(time.diff end start) / 60` -> daqiqada davomiylik).
+        "diff" => {
+            let a = arg_ts(&args, 0, "time.diff")?;
+            let b = arg_ts(&args, 1, "time.diff")?;
+            Ok(Value::Int(a - b))
         }
         _ => Err(Flow::err(format!(
             "time modulida '{}' funksiyasi yo'q",
@@ -496,7 +539,69 @@ fn parse_ts(s: &str) -> Option<i64> {
     let h = num(11, 13)?;
     let mi = num(14, 16)?;
     let se = num(17, 19)?;
+    // Diapazonlarni tekshiramiz — days_from_civil overflow'ni jimgina
+    // "tuzatadi" (mavjud bo'lmagan 02-31 -> 03-03), shuning uchun bu yerda
+    // rad etamiz: booking oqimida noto'g'ri sana sukutsiz qabul qilinmasin.
+    // se 60 — kabisa sekund (ISO ruxsat beradi) — qabul qilamiz.
+    if !(1..=12).contains(&mo)
+        || !(1..=days_in_month(y, mo)).contains(&d)
+        || !(0..=23).contains(&h)
+        || !(0..=59).contains(&mi)
+        || !(0..=60).contains(&se)
+    {
+        return None;
+    }
     Some(days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + se)
+}
+
+// Berilgan yil/oy uchun kunlar soni (kabisa yilni hisobga oladi).
+fn days_in_month(y: i64, m: i64) -> i64 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+            if leap { 29 } else { 28 }
+        }
+        _ => 0, // noto'g'ri oy — chaqiruvchi mo'ni allaqachon tekshiradi
+    }
+}
+
+// Ixtiyoriy ISO-8601 matnni unix sekundga (UTC) o'giradi. parse_ts ustiga
+// quriladi: avval sana+vaqt asosini ("YYYY-MM-DD[ T]HH:MM:SS") o'qiydi, so'ng
+// 19-belgidan keyingi qismdan ixtiyoriy kasr sekund (".sss" — sekund aniqligida
+// tashlanadi) va vaqt mintaqasini ("Z", "±HH:MM", "±HHMM", "±HH") tushunadi.
+// Mintaqa ko'rsatilmasa UTC deb olinadi. Matndagi vaqt mahalliy -> UTC = vaqt - offset.
+// Timestamp'lar ASCII, shuning uchun bayt indeksi = belgi indeksi (boundary xavfsiz).
+fn parse_iso(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let base = parse_ts(s)?; // birinchi 19 belgi (sana + vaqt); len >= 19 kafolat
+    let mut rest = &s[19..];
+    // kasr sekundni o'tkazib yuboramiz (".123") — sekund aniqligida ishlaymiz.
+    if let Some(after_dot) = rest.strip_prefix('.') {
+        let digits = after_dot.bytes().take_while(|b| b.is_ascii_digit()).count();
+        rest = &after_dot[digits..];
+    }
+    let offset = match rest.chars().next() {
+        None => 0,                  // mintaqasiz -> UTC
+        Some('Z') | Some('z') => 0, // Zulu (UTC)
+        Some(sign @ ('+' | '-')) => {
+            // ":" ni e'tiborsiz qoldirib faqat raqamlarni olamiz: HHMM yoki HH.
+            let digits: String = rest[1..].chars().filter(|c| c.is_ascii_digit()).collect();
+            let (hh, mm) = match digits.len() {
+                2 => (digits.parse::<i64>().ok()?, 0),
+                4 => (
+                    digits[0..2].parse::<i64>().ok()?,
+                    digits[2..4].parse::<i64>().ok()?,
+                ),
+                _ => return None,
+            };
+            let off = hh * 3600 + mm * 60;
+            if sign == '-' { -off } else { off }
+        }
+        _ => return None, // tanish bo'lmagan qoldiq -> noto'g'ri matn
+    };
+    Some(base - offset)
 }
 
 // (year, month, day) UTC -> 1970-01-01 dan kunlar (Hinnant teskari).
@@ -937,6 +1042,21 @@ fn arg_int(args: &[Value], i: usize, who: &str) -> Result<i64, Flow> {
         ))),
     }
 }
+// Timestamp argumentini unix sekundga o'qiydi: matn (ISO/kanonik, mintaqa ham)
+// yoki to'g'ridan-to'g'ri unix int. time.fmt/add/diff bir xil kirishni qabul qilsin.
+fn arg_ts(args: &[Value], i: usize, who: &str) -> Result<i64, Flow> {
+    match arg(args, i, who)? {
+        Value::Str(s) => parse_iso(s)
+            .ok_or_else(|| Flow::err(format!("{}: timestamp matnini o'qib bo'lmadi: {}", who, s))),
+        Value::Int(n) => Ok(*n),
+        other => Err(Flow::err(format!(
+            "{}: {}-argument timestamp (str/int) bo'lishi kerak, {} berildi",
+            who,
+            i + 1,
+            other.type_name()
+        ))),
+    }
+}
 fn arg_num(args: &[Value], i: usize, who: &str) -> Result<f64, Flow> {
     match arg(args, i, who)? {
         Value::Int(n) => Ok(*n as f64),
@@ -1043,6 +1163,150 @@ mod time_tests {
         // Manfiy qiymat panic bermasligi kerak — 0 ga klamp qilinadi.
         let r = time_module("sleep", vec![Value::Int(-5)]);
         assert!(matches!(r, Ok(Value::Nil)), "manfiy sleep nil qaytarsin");
+    }
+
+    #[test]
+    fn parse_iso_handles_z_and_offsets() {
+        // "Z" -> UTC; "+HH:MM"/"-HH:MM" mintaqa UTC ga keltiriladi.
+        let z = parse_iso("2026-06-10T10:00:00Z").expect("Z o'qilsin");
+        assert_eq!(parse_iso("2026-06-10 10:00:00"), Some(z)); // mintaqasiz = UTC
+        // +05:00: matndagi vaqt mahalliy, UTC 5 soat oldin.
+        assert_eq!(parse_iso("2026-06-10T15:00:00+05:00"), Some(z));
+        // -05:00: UTC 5 soat keyin.
+        assert_eq!(parse_iso("2026-06-10T05:00:00-05:00"), Some(z));
+        // "+HHMM" (ikki nuqtasiz) va kasr sekund ham o'qilsin.
+        assert_eq!(parse_iso("2026-06-10T15:00:00.123+0500"), Some(z));
+    }
+
+    #[test]
+    fn time_parse_normalizes_to_canonical_utc() {
+        // time.parse ISO matnni kanonik "YYYY-MM-DD HH:MM:SS" UTC ga keltiradi.
+        let Ok(Value::Str(s)) =
+            time_module("parse", vec![Value::Str("2026-06-10T10:00:00Z".into())])
+        else {
+            panic!("time.parse matn qaytarishi kerak");
+        };
+        assert_eq!(s, "2026-06-10 10:00:00");
+    }
+
+    #[test]
+    fn time_parse_rejects_garbage() {
+        let r = time_module("parse", vec![Value::Str("salom".into())]);
+        assert!(r.is_err(), "noto'g'ri matn xato berishi kerak");
+    }
+
+    #[test]
+    fn parse_ts_rejects_impossible_dates() {
+        // Mavjud bo'lmagan sana/vaqt jimgina "tuzatilmasin" — rad etilsin
+        // (days_from_civil overflow'ni normalizatsiya qiladi, biz oldini olamiz).
+        assert_eq!(parse_ts("2026-02-31T10:00:00Z"), None); // fevralda 31 yo'q
+        assert_eq!(parse_ts("2026-02-29 00:00:00"), None); // 2026 kabisa emas
+        assert_eq!(parse_ts("2026-13-01 00:00:00"), None); // 13-oy yo'q
+        assert_eq!(parse_ts("2026-00-10 00:00:00"), None); // 0-oy yo'q
+        assert_eq!(parse_ts("2026-06-00 00:00:00"), None); // 0-kun yo'q
+        assert_eq!(parse_ts("2026-06-10 24:00:00"), None); // 24-soat yo'q
+        assert_eq!(parse_ts("2026-06-10 10:60:00"), None); // 60-daqiqa yo'q
+        // Haqiqiy chekka holatlar QABUL qilinadi:
+        assert!(parse_ts("2024-02-29 00:00:00").is_some()); // 2024 kabisa
+        assert!(parse_ts("2026-12-31 23:59:60").is_some()); // kabisa sekund (60)
+    }
+
+    #[test]
+    fn time_parse_rejects_impossible_date() {
+        let r = time_module("parse", vec![Value::Str("2026-02-31T10:00:00Z".into())]);
+        assert!(r.is_err(), "02-31 mavjud emas — xato berishi kerak");
+    }
+
+    #[test]
+    fn time_add_offsets_arbitrary_timestamp() {
+        // Issue #65 yadrosi: start_at + duration -> end_at.
+        let Ok(Value::Str(end)) = time_module(
+            "add",
+            vec![
+                Value::Str("2026-06-10 10:00:00".into()),
+                Value::Int(30),
+                Value::Str("min".into()),
+            ],
+        ) else {
+            panic!("time.add matn qaytarishi kerak");
+        };
+        assert_eq!(end, "2026-06-10 10:30:00");
+        // Manfiy N orqaga siljitadi.
+        let Ok(Value::Str(before)) = time_module(
+            "add",
+            vec![
+                Value::Str("2026-06-10 10:00:00".into()),
+                Value::Int(-2),
+                Value::Str("hr".into()),
+            ],
+        ) else {
+            panic!("time.add matn qaytarishi kerak");
+        };
+        assert_eq!(before, "2026-06-10 08:00:00");
+    }
+
+    #[test]
+    fn time_add_rejects_bad_unit() {
+        let r = time_module(
+            "add",
+            vec![
+                Value::Str("2026-06-10 10:00:00".into()),
+                Value::Int(1),
+                Value::Str("year".into()),
+            ],
+        );
+        assert!(r.is_err(), "noma'lum birlik xato berishi kerak");
+    }
+
+    #[test]
+    fn time_sub_offsets_backward() {
+        // time.sub — add ning ko'zgusi: berilgan vaqtdan orqaga siljitadi.
+        let Ok(Value::Str(s)) = time_module(
+            "sub",
+            vec![
+                Value::Str("2026-06-10 10:00:00".into()),
+                Value::Int(5),
+                Value::Str("min".into()),
+            ],
+        ) else {
+            panic!("time.sub matn qaytarishi kerak");
+        };
+        assert_eq!(s, "2026-06-10 09:55:00");
+    }
+
+    #[test]
+    fn time_diff_returns_seconds() {
+        // diff a b = a - b sekundda; musbat = a kelajakda.
+        let r = time_module(
+            "diff",
+            vec![
+                Value::Str("2026-06-10 10:30:00".into()),
+                Value::Str("2026-06-10 10:00:00".into()),
+            ],
+        );
+        assert!(matches!(r, Ok(Value::Int(1800))), "30 daqiqa = 1800 sek");
+        // Teskari tartib manfiy beradi.
+        let r = time_module(
+            "diff",
+            vec![
+                Value::Str("2026-06-10 10:00:00".into()),
+                Value::Str("2026-06-10 10:30:00".into()),
+            ],
+        );
+        assert!(matches!(r, Ok(Value::Int(-1800))));
+    }
+
+    #[test]
+    fn time_diff_accepts_iso_with_offset() {
+        // Aralash format: biri ISO mintaqali, biri kanonik — ikkisi ham UTC ga keladi.
+        let r = time_module(
+            "diff",
+            vec![
+                Value::Str("2026-06-10T15:30:00+05:00".into()), // = 10:30 UTC
+                Value::Str("2026-06-10 10:00:00".into()),
+            ],
+        );
+        assert!(matches!(r, Ok(Value::Int(1800))));
     }
 }
 

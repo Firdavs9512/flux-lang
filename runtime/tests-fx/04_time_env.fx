@@ -50,6 +50,41 @@ if (datenum a_day) <= (datenum a_sec)
 else
   bad "time.ago ordering"
 
+# --- time.parse: ixtiyoriy ISO matn -> kanonik UTC timestamp ---
+start_at = time.parse "2026-06-10T10:00:00Z"
+if start_at == "2026-06-10 10:00:00"
+  ok "time.parse ISO 'Z' -> ${start_at}"
+else
+  bad "time.parse Z got=${start_at}"
+
+# mintaqali ISO (+05:00) UTC ga keltiriladi (vaqt 5 soat oldin)
+tz = time.parse "2026-06-10T15:00:00+05:00"
+if tz == "2026-06-10 10:00:00"
+  ok "time.parse '+05:00' -> UTC ${tz}"
+else
+  bad "time.parse offset got=${tz}"
+
+# --- time.add: ixtiyoriy vaqtdan offset (booking: end_at = start_at + duration) ---
+end_at = time.add start_at 30 :min
+if end_at == "2026-06-10 10:30:00"
+  ok "time.add 30:min -> ${end_at}"
+else
+  bad "time.add got=${end_at}"
+
+# --- time.sub: add ko'zgusi — orqaga siljitadi (buffer before) ---
+buf = time.sub start_at 5 :min
+if buf == "2026-06-10 09:55:00"
+  ok "time.sub 5:min -> ${buf}"
+else
+  bad "time.sub got=${buf}"
+
+# --- time.diff: ikki vaqt orasidagi farq sekundda (int) ---
+mins = (time.diff end_at start_at) / 60
+if mins == 30
+  ok "time.diff -> ${mins} daqiqa"
+else
+  bad "time.diff got=${mins}"
+
 # --- env.NOM: muhit o'zgaruvchisi ---
 v = env.FLUX_TEST_VAR
 if v == "salom"

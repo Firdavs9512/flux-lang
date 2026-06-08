@@ -239,6 +239,9 @@ List length `l.len` (member), string length `str.len s` (module).
 ```flux
 time.now · time.ago 24 :hr · time.in 60 :min (:sec :min :hr :day) · time.fmt t "..."
 time.sleep 1 · time.sleep 0.5   # secs kutadi (flt ham) — polling/retry backoff
+time.parse "2026-06-10T10:00:00Z"   # ixtiyoriy ISO matn -> kanonik UTC timestamp ("Z"/"±HH:MM")
+time.add t 30 :min · time.sub t 5 :min   # IXTIYORIY vaqtdan offset (now emas): end_at = start_at + dur
+time.diff a b                       # (a - b) sekundda (int); / 60 -> daqiqa
 db.one "select count(*) c from t where created > $1" [time.ago 24 :hr]
 ```
 
