@@ -194,6 +194,8 @@ user.name        # map key
 list.0           # first element of the list
 list.len         # length
 m[key]           # dynamic key (via a variable)
+list[i]          # computed index (via an expression)
+list.(i)         # computed index through `.` — same as list[i]
 ```
 
 **`..` — range.** Both ends are inclusive:

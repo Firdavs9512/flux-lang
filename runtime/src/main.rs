@@ -284,6 +284,34 @@ b = names.index "billing"
 "#);
     }
 
+    // Hisoblangan indeks: `xs.(ifoda)` va `xs[ifoda]` ikkalasi ham ishlashi kerak.
+    // Issue #64 — pagination/oxirgi element olish uchun literal emas, ifoda-indeks.
+    #[test]
+    fn hisoblangan_indeks() {
+        run(r#"
+xs = ["a" "b" "c"]
+i = xs.len - 1
+
+# .(ifoda) shakli — oxirgi elementni hisoblangan indeks bilan ol
+last = xs.(i)
+(last == "c") | (fail ".(i) oxirgi elementni bermadi: ${last}")
+
+# ichida to'liq ifoda
+(xs.(xs.len - 1) == "c") | (fail "xs.(xs.len - 1) ishlamadi")
+
+# bracket shakli ham bir xil natija beradi
+(xs[i] == "c") | (fail "xs[i] ishlamadi")
+
+# map'ni hisoblangan kalit (str) bilan indekslash
+m = {name: "Ali" age: 30}
+k = "name"
+(m.(k) == "Ali") | (fail "m.(k) ishlamadi: ${m.(k)}")
+
+# chegaradan tashqari -> nil (mavjud get_index xulqi)
+(xs.(99) == nil) | (fail "chegaradan tashqari indeks nil bermadi")
+"#);
+    }
+
     #[test]
     fn map_operations() {
         run(r#"

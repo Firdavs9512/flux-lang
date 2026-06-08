@@ -520,13 +520,30 @@ impl Parser {
             match self.peek() {
                 Tok::Dot => {
                     self.advance();
-                    // .name  yoki  .0 (raqamli indeks)
+                    // .name  yoki  .0 (raqamli indeks)  yoki  .(ifoda) (hisoblangan indeks)
                     match self.peek().clone() {
                         Tok::Int(n) => {
                             self.advance();
                             e = Expr::Index {
                                 target: Box::new(e),
                                 key: Box::new(Expr::Int(n)),
+                            };
+                        }
+                        // `.(ifoda)` — hisoblangan indeks: `xs.(i)`, `xs.(xs.len - 1)`.
+                        // Bracket shakli (`xs[i]`) bilan bir xil Expr::Index quradi;
+                        // ikki shakl ham qo'llab-quvvatlanadi. Qavs ichida to'liq
+                        // application yana yoqiladi (`no_app` muhitidan qat'i nazar).
+                        Tok::LParen => {
+                            self.advance(); // (
+                            let saved = self.no_app;
+                            self.no_app = false;
+                            let key = self.parse_expr();
+                            self.no_app = saved;
+                            let key = key?;
+                            self.expect(&Tok::RParen, "')'")?;
+                            e = Expr::Index {
+                                target: Box::new(e),
+                                key: Box::new(key),
                             };
                         }
                         // Field nomi: oddiy ident yoki KALIT SO'Z (`time.in`, `x.match`).
