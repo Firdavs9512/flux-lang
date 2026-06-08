@@ -818,13 +818,15 @@ row = db.one "select * from t where k=$1" [:a]
             std::env::set_var("DATABASE_URL", format!("sqlite:{}", path.display()));
         }
 
-        // Birinchi process: str (TEXT) ustun bilan jadval yaratadi.
+        // Birinchi process: str (TEXT) ustun bilan jadval yaratadi va bir qator yozadi
+        // (db.ins lazy DB open + migrate qiladi — jadval aynan shu yerda yaratiladi).
         run_source(
             r#"
 use db
 tbl t3
   id   serial pk
   body str
+db.ins "t3" {body:"init"}
 "#,
         )
         .unwrap_or_else(|e| panic!("jadval yaratish: {}", e));
