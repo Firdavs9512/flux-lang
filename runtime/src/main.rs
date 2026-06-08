@@ -1531,6 +1531,27 @@ auth.verify "faqat.ikki""#,
     }
 
     #[test]
+    fn auth_verify_exp_siz_token_rad_etiladi() {
+        let _guard = AUTH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("AUTH_SECRET", "sirli-kalit-123") };
+        // `exp:nil` payload -> auth.jwt `or_insert` nil'ni override qilmaydi,
+        // ya'ni token sonli `exp`siz imzolanadi. To'g'ri imzolangan bo'lsa ham,
+        // auth.verify uni RAD ETISHI kerak (aks holda abadiy amal qilardi —
+        // Codex P2). Kalit to'g'ri, shuning uchun bu imzo emas, exp xatosi.
+        let err = run_source(
+            r#"use auth
+token = auth.jwt {sub:"u1" exp:nil}
+auth.verify token"#,
+        )
+        .expect_err("exp'siz token rad etilishi kerak");
+        assert!(
+            err.contains("exp") || err.contains("muddat"),
+            "kutilgan exp-yo'q xatosi, topildi: {}",
+            err
+        );
+    }
+
+    #[test]
     fn auth_secret_yoq_bolsa_aniq_xato() {
         let _guard = AUTH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AUTH_SECRET").ok();

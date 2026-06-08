@@ -124,7 +124,8 @@ impl Interp {
     // Xato holatlari (hammasi Flow::err — handler'da 401 qaytarish oson):
     //   - shakl noto'g'ri (3 segment emas)
     //   - imzo mos kelmaydi (kalit noto'g'ri yoki token buzilgan)
-    //   - muddat o'tgan (exp < hozir)
+    //   - sonli `exp` yo'q (token muddatsiz — rad etiladi, abadiy bo'lmasin)
+    //   - muddat o'tgan (exp <= hozir)
     fn auth_verify(&self, args: Vec<Value>) -> Result<Value, Flow> {
         let token = match args.first() {
             Some(Value::Str(s)) => s.clone(),
@@ -163,11 +164,22 @@ impl Interp {
             _ => return Err(Flow::err("auth.verify: payload JSON map emas".to_string())),
         };
 
-        // Muddat (exp) tekshiruvi — bo'lsa va o'tgan bo'lsa, xato.
-        if let Some(exp) = claims.get("exp").and_then(as_int)
-            && now_unix() >= exp
-        {
-            return Err(Flow::err("auth.verify: token muddati o'tgan".to_string()));
+        // Muddat (exp) MAJBURIY — sonli `exp` bo'lmasa rad etamiz. Aks holda
+        // `exp`siz (yoki `exp:nil`/sonli-emas) token ABADIY amal qilardi:
+        // `auth.jwt` har doim `exp` qo'shadi, lekin tashqi imzolangan yoki
+        // qo'lda yasalgan payload `exp`siz kelishi mumkin — o'sha holatda
+        // jim "amal qiladi" deyish xavfsizlik teshigi (middleware uni cheksiz
+        // qabul qilardi). Shuning uchun `exp` yo'qligi = noto'g'ri token.
+        match claims.get("exp").and_then(as_int) {
+            Some(exp) if now_unix() >= exp => {
+                return Err(Flow::err("auth.verify: token muddati o'tgan".to_string()));
+            }
+            Some(_) => {}
+            None => {
+                return Err(Flow::err(
+                    "auth.verify: token `exp` (muddat) maydonisiz — rad etildi".to_string(),
+                ));
+            }
         }
         Ok(Value::Map(claims))
     }
