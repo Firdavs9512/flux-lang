@@ -34,7 +34,7 @@ total <- 0          # mutable; reassign: total <- total + 5
 + - * / %      arithmetic. + also concatenates STRINGS: "a"+"b"→"ab"
 == != < <= > >=   ·   & | !  (and/or/not)
 ??   null-coalesce: a ?? b → a, or b if a is nil
-.    member/index: m.key, l.0, l.len, m[k]
+.    member/index: m.key, l.0, l.len, m[k], l[i], l.(i)  (i — computed index)
 ..   range: 1..5 → [1 2 3 4 5]   ·   |>  pipe: x |> f |> g
 ```
 

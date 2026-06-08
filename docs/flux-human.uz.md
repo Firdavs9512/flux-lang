@@ -196,6 +196,8 @@ user.name        # map kaliti
 list.0           # ro'yxatning birinchi elementi
 list.len         # uzunlik
 m[key]           # dinamik kalit (o'zgaruvchi orqali)
+list[i]          # hisoblangan indeks (ifoda bilan)
+list.(i)         # `.` orqali hisoblangan indeks — list[i] bilan bir xil
 ```
 
 **`..` — diapazon (range).** Ikkala chet ham kiradi:
