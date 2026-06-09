@@ -878,6 +878,25 @@ time.diff a b          # (a - b) difference in seconds (int); / 60 -> minutes
 > r = db.one "select count(*) c from tickets where created > $1" [time.ago 24 :hr]
 > ```
 
+**Duration & interval recipes** (interval arithmetic IS available — `time.add`/`diff` exist):
+```flux
+end_at = time.add start_at dur :min            # duration: start + dur minutes
+mins   = (time.diff end_at start_at) / 60       # gap between two times -> minutes
+overlap = a.start < b.end & a.end > b.start     # do two intervals overlap? (bool)
+buf_start = time.sub start_at 15 :min           # buffer: 15 min before start
+```
+
+**IANA timezone / DST** — `time.parse` takes an optional zone name; `time.fmt`
+takes an optional zone as a third argument. Wall-clock ↔ UTC conversion is
+DST-aware (NOT a fixed offset), so "09:00 local every day" lands on the correct
+UTC instant across summer/winter transitions:
+```flux
+utc = time.parse "2026-07-15 09:00:00" "Asia/Tashkent"   # local wall-clock -> UTC
+loc = time.fmt utc "HH:mm" "America/New_York"             # UTC instant -> zone wall-clock
+```
+> A wall-clock time in a spring-forward gap (e.g. `02:30` on the night clocks
+> jump) does not exist and raises an error; an unknown zone name raises too.
+
 ### 9.6 `json`
 ```flux
 use json

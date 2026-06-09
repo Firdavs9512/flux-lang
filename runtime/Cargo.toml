@@ -30,6 +30,10 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 cron = "0.12"
 # cron crate UTC sana-vaqt arifmetikasi uchun chrono'ga tayanadi (next-run hisoblash).
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# time battery: IANA zona nomlari (`Asia/Tashkent`) -> DST-aware wall-clock konversiya.
+# Sof Rust, zona ma'lumotlari kompilyatsiyaga bog'lanadi (tizim tzdata kerak emas) —
+# `rusqlite bundled` / webpki-roots falsafasiga mos, CI/portable barqaror.
+chrono-tz = { version = "0.10", default-features = false }
 # auth battery: JWT (HS256) imzolash/tekshirish — HMAC-SHA256. Sof Rust
 # (RustCrypto), C toolchain/OpenSSL talab qilmaydi — `rusqlite bundled` /
 # webpki-roots falsafasiga mos, CI'da portativ va yashil.
