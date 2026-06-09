@@ -706,6 +706,47 @@ log "missing=${m.b ?? "yo'q"}"
 "#);
     }
 
+    // Ko'p-qatorli pipe: qator `|>` bilan boshlansa, oldingi ifoda davomi
+    // (builder zanjiri o'qiluvchanligi, issue #78). Faqat `|>` — `|` (Or) emas.
+    #[test]
+    fn multiline_pipe_continuation() {
+        run(r#"
+fn inc x -> x + 1
+fn dbl x -> x * 2
+# bosqichlar yangi qatorda, leading |>
+r = 5
+  |> inc
+  |> dbl
+  |> inc
+(r == 13) | (fail "ko'p-qatorli pipe noto'g'ri: ${r}")
+# izoh va bo'sh qator orasida ham davom etadi
+r2 = 10
+  |> inc
+
+  # bu yerda izoh
+  |> dbl
+(r2 == 22) | (fail "izoh/bo'sh qator orqali pipe davomi buzildi: ${r2}")
+"#);
+    }
+
+    // Pipe qisman chaqiruv: `x |> f a b` => `f a b x` (lhs OXIRGI argument).
+    // Builder/chain naqshini ishlatadi. Argumentsiz funksiya qiymati va
+    // argumentsiz modul chaqiruvi (`|> str.up`) eski xulqni saqlaydi.
+    #[test]
+    fn pipe_partial_application() {
+        run(r#"
+fn addto base n -> base + n
+# argumentli chaqiruv: lhs oxirgi argument bo'lib qo'shiladi
+(5 |> addto 100) == 105 | (fail "pipe argumentli chaqiruv ishlamadi")
+# zanjir
+(3 |> addto 10 |> addto 100) == 113 | (fail "pipe zanjir ishlamadi")
+# argumentsiz modul chaqiruvi (eski xulq saqlanishi kerak)
+("hello" |> str.up) == "HELLO" | (fail "pipe argumentsiz modul chaqiruvi buzildi")
+# lambda (eski xulq)
+(5 |> \n -> n * 2) == 10 | (fail "pipe lambda buzildi")
+"#);
+    }
+
     // --- db battery testlari (in-memory SQLite, har Interp alohida DB) ---
 
     // DATABASE_URL global env — uni o'rnatib darhol run qilish race bo'lmasligi
@@ -760,6 +801,106 @@ only = db.q "select * from items where kind=$1" [:a]
 (only.len == 1) | (fail "$1 sym param 1 qator")
 "#);
         });
+    }
+
+    // Deklarativ o'qish builder'i (issue #78): db.from |> db.eq/cmp/order/limit
+    // |> db.all/first. List qiymat → IN. Xom SQL'siz filtr+range+order+paging.
+    #[test]
+    fn db_query_builder_reads() {
+        with_db_test("query_builder", || {
+            run(r#"
+use db
+tbl bookings
+  id          serial pk
+  tenant_id   int
+  resource_id int
+  status      sym
+  start_at    str
+db.ins "bookings" {tenant_id:1 resource_id:5 status::done start_at:"2026-06-01"}
+db.ins "bookings" {tenant_id:1 resource_id:5 status::confirmed start_at:"2026-06-02"}
+db.ins "bookings" {tenant_id:1 resource_id:7 status::pending start_at:"2026-06-03"}
+db.ins "bookings" {tenant_id:2 resource_id:9 status::done start_at:"2026-06-04"}
+
+# IN-filtr (list qiymat) + order
+in_rows = db.from "bookings" |> db.eq {tenant_id:1 status:[:pending :confirmed]} |> db.order :start_at |> db.all
+(in_rows.len == 2) | (fail "IN-filtr 2 qator kutilgan, ${in_rows.len}")
+match in_rows.0.status
+  :confirmed -> log "ok IN order"
+  _ -> fail "order start_at noto'g'ri"
+
+# cmp range + limit
+rng = db.from "bookings" |> db.eq {tenant_id:1} |> db.cmp :start_at :ge "2026-06-02" |> db.limit 10 |> db.all
+(rng.len == 2) | (fail "cmp >= 2 qator kutilgan, ${rng.len}")
+
+# first — bitta yoki nil
+one = db.from "bookings" |> db.eq {tenant_id:1 resource_id:7} |> db.first
+(one != nil) | (fail "first nil qaytardi")
+match one.status
+  :pending -> log "ok first"
+  _ -> fail "first noto'g'ri qator"
+
+# first — mos qator yo'q → nil
+none = db.from "bookings" |> db.eq {tenant_id:99} |> db.first
+(none == nil) | (fail "first mos yo'qda nil kutilgan")
+
+# bo'sh IN list → hech narsa
+empty = db.from "bookings" |> db.eq {status:[]} |> db.all
+(empty.len == 0) | (fail "bo'sh IN 0 qator kutilgan")
+
+# nil qiymat → IS NULL ( = NULL hech qachon mos kelmaydi). resource_id null qator.
+db.ins "bookings" {tenant_id:1 resource_id:nil status::pending start_at:"2026-06-09"}
+nulls = db.from "bookings" |> db.eq {tenant_id:1 resource_id:nil} |> db.all
+(nulls.len == 1) | (fail "nil → IS NULL 1 qator kutilgan, ${nulls.len}")
+"#);
+        });
+    }
+
+    // Aggregatsiya builder'i: group + count/sum + conditional agg (count_if/sum_if).
+    #[test]
+    fn db_query_builder_agg() {
+        with_db_test("query_builder_agg", || {
+            run(r#"
+use db
+tbl bookings
+  id          serial pk
+  tenant_id   int
+  resource_id int
+  status      sym
+  total_cents money
+db.ins "bookings" {tenant_id:1 resource_id:5 status::done total_cents:5000}
+db.ins "bookings" {tenant_id:1 resource_id:5 status::confirmed total_cents:3000}
+db.ins "bookings" {tenant_id:1 resource_id:7 status::pending total_cents:1000}
+
+# group + count + sum, order desc
+ag = db.from "bookings" |> db.eq {tenant_id:1 status:[:done :confirmed]} |> db.group :resource_id |> db.count :n |> db.sum :total_cents :rev |> db.order :rev :desc |> db.agg
+(ag.len == 1) | (fail "agg 1 guruh kutilgan, ${ag.len}")
+(ag.0.resource_id == 5) | (fail "agg resource_id 5")
+(ag.0.n == 2) | (fail "agg count 2, ${ag.0.n}")
+(ag.0.rev == 8000) | (fail "agg sum 8000, ${ag.0.rev}")
+
+# conditional agg (overview, group'siz) → bitta qator
+ov = db.from "bookings" |> db.eq {tenant_id:1} |> db.count_if {status::confirmed} :confirmed |> db.count_if {status::pending} :pending |> db.sum_if :total_cents {status::done} :revenue |> db.agg_row
+(ov.confirmed == 1) | (fail "count_if confirmed 1, ${ov.confirmed}")
+(ov.pending == 1) | (fail "count_if pending 1, ${ov.pending}")
+(ov.revenue == 5000) | (fail "sum_if revenue 5000, ${ov.revenue}")
+
+# bo'sh tenant: count_if 0 qaytarishi kerak (nil emas — COUNT semantikasi)
+empty_ov = db.from "bookings" |> db.eq {tenant_id:99} |> db.count_if {status::done} :done |> db.agg_row
+(empty_ov.done == 0) | (fail "bo'sh count_if 0 kutilgan (nil emas), ${empty_ov.done}")
+"#);
+        });
+    }
+
+    // str.sym: string→symbol (query-string statuslarini sym filtrga aylantirish).
+    #[test]
+    fn str_sym_conversion() {
+        run(r#"
+(str.sym "done" == :done) | (fail "str.sym done")
+syms = (str.split "pending,confirmed" ",").map \s -> str.sym s
+(syms.0 == :pending) | (fail "str.sym split 0")
+(syms.1 == :confirmed) | (fail "str.sym split 1")
+(str.sym " done " == :done) | (fail "str.sym trim")
+"#);
     }
 
     #[test]

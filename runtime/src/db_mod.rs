@@ -585,6 +585,32 @@ impl Interp {
             "del" => self.db_del(args),
             "put" => self.db_put(args),
             "tx" => self.db_tx(args),
+            // --- deklarativ o'qish builder'i (issue #78) ---
+            // db.from "t" |> db.eq {...} |> db.cmp :c :ge v |> db.order :c
+            //   |> db.limit n |> db.offset m |> db.all|db.first
+            // Aggregatsiya: |> db.group :c |> db.count :out |> db.sum :c :out
+            //   |> db.count_if {f} :out |> db.sum_if :c {f} :out |> db.agg|db.agg_row
+            // Builder holati Value::Map ichida `__dbq` marker bilan oqib boradi
+            // (pipe har bosqichni keyingisining OXIRGI argumenti qiladi).
+            "from" => db_from(args),
+            "eq" => db_stage_eq(args),
+            "cmp" => db_stage_cmp(args),
+            "order" => db_stage_order(args),
+            "limit" => db_stage_limit(args),
+            "offset" => db_stage_offset(args),
+            "group" => db_stage_group(args),
+            "count" => db_stage_agg(args, "count", false),
+            "sum" => db_stage_agg(args, "sum", false),
+            "avg" => db_stage_agg(args, "avg", false),
+            "min" => db_stage_agg(args, "min", false),
+            "max" => db_stage_agg(args, "max", false),
+            "count_if" => db_stage_count_if(args),
+            "sum_if" => db_stage_agg_if(args, "sum"),
+            "avg_if" => db_stage_agg_if(args, "avg"),
+            "all" => self.db_run_query(args, RunMode::All),
+            "first" => self.db_run_query(args, RunMode::First),
+            "agg" => self.db_run_query(args, RunMode::Agg),
+            "agg_row" => self.db_run_query(args, RunMode::AggRow),
             _ => Err(Flow::err(format!("db modulida '{}' funksiyasi yo'q", func))),
         }
     }
@@ -813,6 +839,272 @@ impl Interp {
     fn db_builder(&self, f: impl FnOnce(&dyn Db) -> String) -> Result<String, Flow> {
         let db = self.db()?;
         Ok(f(db.as_ref()))
+    }
+
+    // Builder terminal: db.all/first/agg/agg_row. Builder map'dan SQL yasab
+    // bajaradi va natijani rejimga qarab qaytaradi.
+    fn db_run_query(self: &Arc<Self>, args: Vec<Value>, mode: RunMode) -> Result<Value, Flow> {
+        let who = match mode {
+            RunMode::All => "db.all",
+            RunMode::First => "db.first",
+            RunMode::Agg => "db.agg",
+            RunMode::AggRow => "db.agg_row",
+        };
+        let (b, _) = take_builder(args, who)?;
+        let table = match b.get("table") {
+            Some(Value::Str(s)) => s.clone(),
+            _ => return Err(Flow::err(format!("{}: builder'da jadval yo'q", who))),
+        };
+
+        // Bog'lash qiymatlari ($1, $2, ...) — SQL'dagi joylashish tartibida.
+        // Agg holatida SELECT ichidagi shartli filtr bind'lari WHERE'dan OLDIN
+        // keladi, shuning uchun build_agg_select'ni build_where'dan OLDIN
+        // chaqiramiz (aks holda $N raqamlari siljib ketadi).
+        let mut binds: Vec<SqlVal> = Vec::new();
+        let is_agg = matches!(mode, RunMode::Agg | RunMode::AggRow);
+        let select_sql = if is_agg {
+            self.build_agg_select(&table, &b, &mut binds)?
+        } else {
+            format!("SELECT * FROM {}", q_ident(&table))
+        };
+
+        // WHERE bo'laklari (bind'lar SELECT'dan keyin davom etadi).
+        let mut where_parts: Vec<String> = Vec::new();
+        self.build_where(&table, &b, &mut where_parts, &mut binds)?;
+
+        let mut sql = select_sql;
+        if !where_parts.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&where_parts.join(" AND "));
+        }
+        // GROUP BY (faqat agg + group bo'lsa).
+        if is_agg && let Some(Value::List(cols)) = b.get("group") {
+            let gb = cols
+                .iter()
+                .filter_map(|v| {
+                    if let Value::Str(s) = v {
+                        Some(q_ident(s))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            if !gb.is_empty() {
+                sql.push_str(" GROUP BY ");
+                sql.push_str(&gb);
+            }
+        }
+        // ORDER BY.
+        if let Some(Value::List(o)) = b.get("order")
+            && let (Some(Value::Str(col)), desc) = (o.first(), o.get(1))
+        {
+            let dir = if matches!(desc, Some(Value::Bool(true))) {
+                " DESC"
+            } else {
+                ""
+            };
+            sql.push_str(&format!(" ORDER BY {}{}", q_ident(col), dir));
+        }
+        // LIMIT / OFFSET (agg_row/first uchun limit 1 majburiy emas — natijani
+        // kod tomonda olamiz, lekin first uchun LIMIT 1 qo'shamiz).
+        if matches!(mode, RunMode::First) {
+            sql.push_str(" LIMIT 1");
+        } else if let Some(Value::Int(n)) = b.get("limit") {
+            sql.push_str(&format!(" LIMIT {}", n));
+            if let Some(Value::Int(off)) = b.get("offset") {
+                sql.push_str(&format!(" OFFSET {}", off));
+            }
+        }
+
+        let rows = with_db(
+            self,
+            |tx| tx.query(&sql, &binds),
+            |db| db.query(&sql, &binds),
+        )?;
+
+        match mode {
+            RunMode::All | RunMode::Agg => Ok(Value::List(
+                rows.into_iter()
+                    .map(|r| self.row_to_value(Some(&table), r))
+                    .collect(),
+            )),
+            RunMode::First | RunMode::AggRow => match rows.into_iter().next() {
+                Some(r) => Ok(self.row_to_value(Some(&table), r)),
+                None => Ok(Value::Nil),
+            },
+        }
+    }
+
+    // Builder'ning eq/cmp filtrlaridan WHERE bo'laklari va bog'lashlarni yasaydi.
+    fn build_where(
+        &self,
+        table: &str,
+        b: &BTreeMap<String, Value>,
+        parts: &mut Vec<String>,
+        binds: &mut Vec<SqlVal>,
+    ) -> Result<(), Flow> {
+        // eq: {col:val} — tenglik; list qiymat → IN (...).
+        if let Some(Value::Map(eq)) = b.get("eq") {
+            for (col, v) in eq {
+                match v {
+                    Value::List(items) => {
+                        // IN (...) — bo'sh list = doim yolg'on (1=0).
+                        if items.is_empty() {
+                            parts.push("1=0".to_string());
+                            continue;
+                        }
+                        let mut places = Vec::with_capacity(items.len());
+                        for it in items {
+                            binds.push(self.value_to_sqlval(table, col, it)?);
+                            places.push(format!("${}", binds.len()));
+                        }
+                        parts.push(format!("{} IN ({})", q_ident(col), places.join(",")));
+                    }
+                    // nil → IS NULL (SQL'da `= NULL` hech qachon mos kelmaydi).
+                    Value::Nil => {
+                        parts.push(format!("{} IS NULL", q_ident(col)));
+                    }
+                    _ => {
+                        binds.push(self.value_to_sqlval(table, col, v)?);
+                        parts.push(format!("{} = ${}", q_ident(col), binds.len()));
+                    }
+                }
+            }
+        }
+        // cmp: [col, op, val] uchliklari.
+        if let Some(Value::List(cmps)) = b.get("cmp") {
+            for c in cmps {
+                if let Value::List(triple) = c
+                    && let (Some(Value::Str(col)), Some(Value::Str(op)), Some(val)) =
+                        (triple.first(), triple.get(1), triple.get(2))
+                    && let Some(sql_op) = cmp_sql_op(op)
+                {
+                    binds.push(self.value_to_sqlval(table, col, val)?);
+                    parts.push(format!("{} {} ${}", q_ident(col), sql_op, binds.len()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // Aggregatsiya SELECT ro'yxatini yasaydi: group ustunlari + agg ifodalari.
+    // Shartli agg (count_if/sum_if) SUM(CASE WHEN <filter> THEN ... END) bo'ladi —
+    // filter bog'lashlari binds'ga SELECT ichida (WHERE'dan OLDIN) qo'shiladi.
+    fn build_agg_select(
+        &self,
+        table: &str,
+        b: &BTreeMap<String, Value>,
+        binds: &mut Vec<SqlVal>,
+    ) -> Result<String, Flow> {
+        let mut cols: Vec<String> = Vec::new();
+        // group ustunlari natijaga ham chiqadi.
+        if let Some(Value::List(g)) = b.get("group") {
+            for v in g {
+                if let Value::Str(s) = v {
+                    cols.push(q_ident(s));
+                }
+            }
+        }
+        let aggs = match b.get("aggs") {
+            Some(Value::List(a)) if !a.is_empty() => a,
+            _ => {
+                return Err(Flow::err(
+                    "db.agg/agg_row: kamida bitta agregat kerak (db.count/sum/avg/count_if/sum_if)",
+                ));
+            }
+        };
+        for a in aggs {
+            let Value::List(spec) = a else { continue };
+            let kind = str_at(spec, 0);
+            let col = str_at(spec, 1);
+            let out = str_at(spec, 2);
+            let filt = spec.get(3);
+            // Agregat ichidagi ifoda: count → *, boshqalar → ustun.
+            let inner = if kind == "count" {
+                "*".to_string()
+            } else {
+                q_ident(&col)
+            };
+            let expr = match filt {
+                // Shartsiz: COUNT(*) / SUM(col).
+                Some(Value::Nil) | None => format!("{}({})", kind.to_uppercase(), inner),
+                // Shartli: filter'ni CASE WHEN'ga aylantirib agregatga o'raymiz.
+                Some(Value::Map(f)) => {
+                    let cond = self.filter_to_case_cond(table, f, binds)?;
+                    if kind == "count" {
+                        // COUNT(*) FILTER ekvivalenti: SUM(CASE WHEN cond THEN 1 ELSE 0 END).
+                        // COALESCE — bo'sh natijada SUM NULL beradi, lekin count_if
+                        // COUNT semantikasidek 0 qaytarishi kerak (bo'sh tenant
+                        // dashboard'i nil emas 0 ko'rsatsin).
+                        format!("COALESCE(SUM(CASE WHEN {} THEN 1 ELSE 0 END), 0)", cond)
+                    } else {
+                        format!(
+                            "{}(CASE WHEN {} THEN {} END)",
+                            kind.to_uppercase(),
+                            cond,
+                            inner
+                        )
+                    }
+                }
+                _ => return Err(Flow::err("db.agg: ichki xato — filtr turi noto'g'ri")),
+            };
+            cols.push(format!("{} AS {}", expr, q_ident(&out)));
+        }
+        Ok(format!(
+            "SELECT {} FROM {}",
+            cols.join(", "),
+            q_ident(table)
+        ))
+    }
+
+    // Shartli agregat filtrini SQL CASE-shartiga aylantiradi (col = $N AND ...),
+    // list qiymat → IN. Bog'lashlar binds'ga qo'shiladi (tartib muhim — bu
+    // SELECT ichida, WHERE'dan oldin chaqiriladi).
+    fn filter_to_case_cond(
+        &self,
+        table: &str,
+        f: &BTreeMap<String, Value>,
+        binds: &mut Vec<SqlVal>,
+    ) -> Result<String, Flow> {
+        let mut conds = Vec::new();
+        for (col, v) in f {
+            match v {
+                Value::List(items) => {
+                    if items.is_empty() {
+                        conds.push("1=0".to_string());
+                        continue;
+                    }
+                    let mut places = Vec::with_capacity(items.len());
+                    for it in items {
+                        binds.push(self.value_to_sqlval(table, col, it)?);
+                        places.push(format!("${}", binds.len()));
+                    }
+                    conds.push(format!("{} IN ({})", q_ident(col), places.join(",")));
+                }
+                // nil → IS NULL.
+                Value::Nil => {
+                    conds.push(format!("{} IS NULL", q_ident(col)));
+                }
+                _ => {
+                    binds.push(self.value_to_sqlval(table, col, v)?);
+                    conds.push(format!("{} = ${}", q_ident(col), binds.len()));
+                }
+            }
+        }
+        if conds.is_empty() {
+            Ok("1=1".to_string())
+        } else {
+            Ok(conds.join(" AND "))
+        }
+    }
+}
+
+// agg spec list'idan i-pozitsiyadagi string (yoki bo'sh).
+fn str_at(spec: &[Value], i: usize) -> String {
+    match spec.get(i) {
+        Some(Value::Str(s)) => s.clone(),
+        _ => String::new(),
     }
 }
 
@@ -1045,4 +1337,284 @@ fn extract_from_table(sql: &str) -> Option<String> {
         .take_while(|c| c.is_alphanumeric() || *c == '_')
         .collect();
     if tok.is_empty() { None } else { Some(tok) }
+}
+
+// ==================== deklarativ o'qish builder'i (issue #78) ====================
+//
+// Builder holati Value::Map ichida saqlanadi — yangi Value varianti kiritmasdan
+// (Send+Sync, json/display invariantlari avtomat saqlanadi). `__dbq` marker
+// kaliti uni oddiy map'dan ajratadi. Pipe har bosqichni keyingi db.* ning OXIRGI
+// argumenti qiladi (`q |> db.eq {...}` => `db.eq {...} q`), shuning uchun bosqich
+// funksiyalari builder'ni args OXIRIDAN oladi.
+
+const DBQ_MARKER: &str = "__dbq";
+
+// Builder map'ni boshlaydi: faqat jadval nomi bilan.
+fn db_from(args: Vec<Value>) -> Result<Value, Flow> {
+    let table = match args.first() {
+        Some(Value::Str(s)) => s.clone(),
+        _ => {
+            return Err(Flow::err(
+                "db.from: 1-argument jadval nomi (str) bo'lishi kerak",
+            ));
+        }
+    };
+    let mut b = BTreeMap::new();
+    b.insert(DBQ_MARKER.to_string(), Value::Bool(true));
+    b.insert("table".to_string(), Value::Str(table));
+    Ok(Value::Map(b))
+}
+
+// Argumentlar OXIRIDAN builder map'ni ajratadi (pipe lhs oxirgi argument).
+// Qaytaradi: (builder_map, qolgan_argumentlar). Builder topilmasa aniq xato —
+// bosqich pipe'siz/db.from'siz chaqirilgan.
+fn take_builder(
+    mut args: Vec<Value>,
+    who: &str,
+) -> Result<(BTreeMap<String, Value>, Vec<Value>), Flow> {
+    match args.pop() {
+        Some(Value::Map(m)) if m.contains_key(DBQ_MARKER) => Ok((m, args)),
+        _ => Err(Flow::err(format!(
+            "{}: builder topilmadi — `db.from \"t\" |> {}` ko'rinishida ishlating",
+            who, who
+        ))),
+    }
+}
+
+// Builder ichidagi list maydonga element qo'shadi (yo'q bo'lsa yaratadi).
+fn push_into(b: &mut BTreeMap<String, Value>, key: &str, item: Value) {
+    match b.get_mut(key) {
+        Some(Value::List(xs)) => xs.push(item),
+        _ => {
+            b.insert(key.to_string(), Value::List(vec![item]));
+        }
+    }
+}
+
+// db.eq {col:val ...} — tenglik filtrlari (AND). List qiymat → IN.
+fn db_stage_eq(args: Vec<Value>) -> Result<Value, Flow> {
+    let (mut b, rest) = take_builder(args, "db.eq")?;
+    let filt = match rest.first() {
+        Some(Value::Map(m)) => m.clone(),
+        _ => return Err(Flow::err("db.eq: 1-argument map ({...}) bo'lishi kerak")),
+    };
+    // Mavjud eq map'ga qo'shamiz (bir nechta db.eq chaqirilishi mumkin).
+    let mut eq = match b.remove("eq") {
+        Some(Value::Map(m)) => m,
+        _ => BTreeMap::new(),
+    };
+    for (k, v) in filt {
+        eq.insert(k, v);
+    }
+    b.insert("eq".to_string(), Value::Map(eq));
+    Ok(Value::Map(b))
+}
+
+// db.cmp :col :op val — bitta taqqoslash (:gt :ge :lt :le :ne :like).
+fn db_stage_cmp(args: Vec<Value>) -> Result<Value, Flow> {
+    let (mut b, rest) = take_builder(args, "db.cmp")?;
+    if rest.len() < 3 {
+        return Err(Flow::err("db.cmp: :col :op val — 3 argument kerak"));
+    }
+    let col = arg_col(&rest[0], "db.cmp")?;
+    let op = arg_sym(&rest[1], "db.cmp op")?;
+    if cmp_sql_op(&op).is_none() {
+        return Err(Flow::err(format!(
+            "db.cmp: noma'lum operator :{} (:gt :ge :lt :le :ne :like)",
+            op
+        )));
+    }
+    let val = rest[2].clone();
+    // [col, op, val] uchligi cmp ro'yxatiga.
+    push_into(
+        &mut b,
+        "cmp",
+        Value::List(vec![Value::Str(col), Value::Str(op), val]),
+    );
+    Ok(Value::Map(b))
+}
+
+// db.order :col [:desc].
+fn db_stage_order(args: Vec<Value>) -> Result<Value, Flow> {
+    let (mut b, rest) = take_builder(args, "db.order")?;
+    let col = match rest.first() {
+        Some(v) => arg_col(v, "db.order")?,
+        None => return Err(Flow::err("db.order: :col argumenti kerak")),
+    };
+    let desc = matches!(rest.get(1), Some(Value::Sym(s)) if s == "desc");
+    b.insert(
+        "order".to_string(),
+        Value::List(vec![Value::Str(col), Value::Bool(desc)]),
+    );
+    Ok(Value::Map(b))
+}
+
+fn db_stage_limit(args: Vec<Value>) -> Result<Value, Flow> {
+    let (mut b, rest) = take_builder(args, "db.limit")?;
+    let n = arg_int(rest.first(), "db.limit")?;
+    b.insert("limit".to_string(), Value::Int(n));
+    Ok(Value::Map(b))
+}
+
+fn db_stage_offset(args: Vec<Value>) -> Result<Value, Flow> {
+    let (mut b, rest) = take_builder(args, "db.offset")?;
+    let n = arg_int(rest.first(), "db.offset")?;
+    b.insert("offset".to_string(), Value::Int(n));
+    Ok(Value::Map(b))
+}
+
+// db.group :col (yoki list of sym/str).
+fn db_stage_group(args: Vec<Value>) -> Result<Value, Flow> {
+    let (mut b, rest) = take_builder(args, "db.group")?;
+    let cols: Vec<Value> = match rest.first() {
+        Some(Value::List(xs)) => xs
+            .iter()
+            .map(|v| arg_col(v, "db.group").map(Value::Str))
+            .collect::<Result<_, _>>()?,
+        Some(v) => vec![Value::Str(arg_col(v, "db.group")?)],
+        None => return Err(Flow::err("db.group: :col argumenti kerak")),
+    };
+    b.insert("group".to_string(), Value::List(cols));
+    Ok(Value::Map(b))
+}
+
+// db.count :out  /  db.sum :col :out  (va avg/min/max).
+fn db_stage_agg(args: Vec<Value>, kind: &str, _cond: bool) -> Result<Value, Flow> {
+    let (mut b, rest) = take_builder(args, &format!("db.{kind}"))?;
+    // count: faqat :out; boshqalar: :col :out.
+    let (col, out) = if kind == "count" {
+        let out = match rest.first() {
+            Some(v) => arg_col(v, "db.count")?,
+            None => return Err(Flow::err("db.count: :out (chiqish nomi) argumenti kerak")),
+        };
+        (String::new(), out)
+    } else {
+        if rest.len() < 2 {
+            return Err(Flow::err(format!(
+                "db.{kind}: :col :out — 2 argument kerak"
+            )));
+        }
+        (arg_col(&rest[0], "db.agg")?, arg_col(&rest[1], "db.agg")?)
+    };
+    // [kind, col, out, filter(yoki nil)].
+    push_into(
+        &mut b,
+        "aggs",
+        Value::List(vec![
+            Value::Str(kind.to_string()),
+            Value::Str(col),
+            Value::Str(out),
+            Value::Nil,
+        ]),
+    );
+    Ok(Value::Map(b))
+}
+
+// db.count_if {filter} :out — shartli sanoq (COUNT(*) FILTER ... CASE WHEN).
+fn db_stage_count_if(args: Vec<Value>) -> Result<Value, Flow> {
+    let (mut b, rest) = take_builder(args, "db.count_if")?;
+    if rest.len() < 2 {
+        return Err(Flow::err("db.count_if: {filter} :out — 2 argument kerak"));
+    }
+    let filt = match &rest[0] {
+        Value::Map(m) => Value::Map(m.clone()),
+        _ => {
+            return Err(Flow::err(
+                "db.count_if: 1-argument filtr map ({...}) bo'lishi kerak",
+            ));
+        }
+    };
+    let out = arg_col(&rest[1], "db.count_if")?;
+    push_into(
+        &mut b,
+        "aggs",
+        Value::List(vec![
+            Value::Str("count".to_string()),
+            Value::Str(String::new()),
+            Value::Str(out),
+            filt,
+        ]),
+    );
+    Ok(Value::Map(b))
+}
+
+// db.sum_if :col {filter} :out — shartli yig'indi/o'rtacha.
+fn db_stage_agg_if(args: Vec<Value>, kind: &str) -> Result<Value, Flow> {
+    let (mut b, rest) = take_builder(args, &format!("db.{kind}_if"))?;
+    if rest.len() < 3 {
+        return Err(Flow::err(format!(
+            "db.{kind}_if: :col {{filter}} :out — 3 argument kerak"
+        )));
+    }
+    let col = arg_col(&rest[0], "db.agg_if")?;
+    let filt = match &rest[1] {
+        Value::Map(m) => Value::Map(m.clone()),
+        _ => {
+            return Err(Flow::err(format!(
+                "db.{kind}_if: 2-argument filtr map ({{...}}) bo'lishi kerak"
+            )));
+        }
+    };
+    let out = arg_col(&rest[2], "db.agg_if")?;
+    push_into(
+        &mut b,
+        "aggs",
+        Value::List(vec![
+            Value::Str(kind.to_string()),
+            Value::Str(col),
+            Value::Str(out),
+            filt,
+        ]),
+    );
+    Ok(Value::Map(b))
+}
+
+// Terminal rejimi: natija qanday qaytadi.
+#[derive(Clone, Copy, PartialEq)]
+enum RunMode {
+    All,    // list of maps
+    First,  // bitta map yoki nil
+    Agg,    // group bo'yicha list of maps
+    AggRow, // bitta agg qator (group'siz)
+}
+
+// Sym operatorni SQL operatoriga.
+fn cmp_sql_op(op: &str) -> Option<&'static str> {
+    Some(match op {
+        "gt" => ">",
+        "ge" => ">=",
+        "lt" => "<",
+        "le" => "<=",
+        "ne" => "!=",
+        "like" => "like",
+        _ => return None,
+    })
+}
+
+// --- builder argument yordamchilari ---
+
+// Ustun nomi: sym (:col) yoki str ("col").
+fn arg_col(v: &Value, who: &str) -> Result<String, Flow> {
+    match v {
+        Value::Sym(s) | Value::Str(s) => Ok(s.clone()),
+        _ => Err(Flow::err(format!(
+            "{}: ustun nomi sym (:col) yoki str bo'lishi kerak, {} berildi",
+            who,
+            v.type_name()
+        ))),
+    }
+}
+
+fn arg_sym(v: &Value, who: &str) -> Result<String, Flow> {
+    match v {
+        Value::Sym(s) => Ok(s.clone()),
+        _ => Err(Flow::err(format!("{}: sym (:op) bo'lishi kerak", who))),
+    }
+}
+
+fn arg_int(v: Option<&Value>, who: &str) -> Result<i64, Flow> {
+    match v {
+        Some(Value::Int(n)) => Ok(*n),
+        _ => Err(Flow::err(format!("{}: int argument kerak", who))),
+    }
 }
