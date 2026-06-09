@@ -551,6 +551,23 @@ t = time.parse "2026-06-10T15:00:00+05:00"
     }
 
     #[test]
+    fn time_parse_fmt_iana_zone_dst() {
+        // Issue #80: IANA zona nomi bilan DST-aware konversiya. "09:00 local"
+        // qishda va yozda turli UTC ga tushadi — fiksrlangan offset emas.
+        run(r#"
+# Qish (EST = UTC-5): 09:00 local -> 14:00 UTC
+w = time.parse "2026-01-15 09:00:00" "America/New_York"
+(w == "2026-01-15 14:00:00") | (fail "qish DST noto'g'ri: ${w}")
+# Yoz (EDT = UTC-4): aynan shu wall-clock -> 13:00 UTC
+s = time.parse "2026-07-15 09:00:00" "America/New_York"
+(s == "2026-07-15 13:00:00") | (fail "yoz DST noto'g'ri: ${s}")
+# Teskari yo'l: UTC instant -> zona wall-clock'i (ko'rsatish uchun)
+back = time.fmt s "HH:mm" "America/New_York"
+(back == "09:00") | (fail "fmt zona noto'g'ri: ${back}")
+"#);
+    }
+
+    #[test]
     fn keyword_as_field_name() {
         // `.` dan keyin kalit so'z field nomi bo'la oladi (time.in shu tufayli ishlaydi).
         // Map kaliti kalit so'z bo'lsa ham `.in`/`.match` bilan o'qiladi — bu Flux

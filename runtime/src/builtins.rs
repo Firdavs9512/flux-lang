@@ -253,25 +253,55 @@ fn time_module(func: &str, args: Vec<Value>) -> R {
         }
         // time.fmt timestamp "..." -> matn formatlash.
         // Kirish: matn timestamp ("YYYY-MM-DD HH:MM:SS", ISO mintaqa ham) yoki unix int.
-        // Token'lar: YYYY MM DD HH mm ss
+        // Token'lar: YYYY MM DD HH mm ss. Sukutda UTC wall-clock'ni formatlaydi.
+        //
+        // Ixtiyoriy 3-argument — IANA zona nomi: `time.fmt t "HH:mm" "Asia/Tashkent"`.
+        // UTC instant'ni o'sha zonaning local wall-clock'iga (DST hisobga olinib)
+        // o'tkazib formatlaydi — foydalanuvchiga mahalliy vaqtni ko'rsatish uchun.
         "fmt" => {
             let ts = arg_ts(&args, 0, "time.fmt")?;
             let pat = arg_str(&args, 1, "time.fmt")?;
-            Ok(Value::Str(strftime(ts, &pat)))
+            match args.get(2) {
+                Some(_) => {
+                    let zone = arg_str(&args, 2, "time.fmt")?;
+                    let out = fmt_in_zone(ts, &pat, &zone).ok_or_else(|| {
+                        Flow::err(format!("time.fmt: noma'lum IANA zona nomi: {}", zone))
+                    })?;
+                    Ok(Value::Str(out))
+                }
+                None => Ok(Value::Str(strftime(ts, &pat))),
+            }
         }
         // time.parse "2026-06-10T10:00:00Z" -> kanonik UTC matn timestamp.
         // Ixtiyoriy ISO-8601 matnni (mijoz/tashqi API bergan) ichki kanonik
         // "YYYY-MM-DD HH:MM:SS" UTC formatiga keltiradi — shunda time.add/time.diff
         // va DB filtrlari u bilan bevosita ishlaydi. "Z", "±HH:MM"/"±HHMM" mintaqa
         // va kasr sekundni tushunadi; mintaqasiz matn UTC deb qabul qilinadi.
+        //
+        // Ixtiyoriy 2-argument — IANA zona nomi: `time.parse "2026-03-08 09:00" "America/New_York"`.
+        // Bu holda matndagi wall-clock vaqt o'sha zonada (DST hisobga olinib) talqin
+        // qilinadi va UTC ga aylantiriladi — fiksrlangan offset emas. "09:00 local"
+        // har kuni to'g'ri UTC ga tushadi, yoz/qish o'tishida ham (PRD §6.8).
         "parse" => {
             let s = arg_str(&args, 0, "time.parse")?;
-            let ts = parse_iso(&s).ok_or_else(|| {
-                Flow::err(format!(
-                    "time.parse: ISO timestamp matnini o'qib bo'lmadi: {}",
-                    s
-                ))
-            })?;
+            let ts = match args.get(1) {
+                Some(_) => {
+                    let zone = arg_str(&args, 1, "time.parse")?;
+                    parse_in_zone(&s, &zone).ok_or_else(|| {
+                        Flow::err(format!(
+                            "time.parse: '{}' zonasida '{}' vaqtini o'qib bo'lmadi \
+                             (noma'lum zona yoki DST sakrashida mavjud bo'lmagan local vaqt)",
+                            zone, s
+                        ))
+                    })?
+                }
+                None => parse_iso(&s).ok_or_else(|| {
+                    Flow::err(format!(
+                        "time.parse: ISO timestamp matnini o'qib bo'lmadi: {}",
+                        s
+                    ))
+                })?,
+            };
             Ok(Value::Str(fmt_unix(ts)))
         }
         // time.add t N :birlik -> t timestamp'ga N birlik QO'SHIB UTC matn qaytaradi.
@@ -639,12 +669,58 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 
 fn strftime(unix: i64, pat: &str) -> String {
     let (y, mo, d, h, mi, s) = civil(unix);
+    strftime_fields(y, mo, d, h, mi, s, pat)
+}
+
+// Sana/vaqt maydonlaridan matn yasaydi — UTC (civil) va zona-aware (fmt_in_zone)
+// yo'llari bir xil token to'plamini ishlatsin uchun ajratib olingan.
+fn strftime_fields(y: i64, mo: u32, d: u32, h: u32, mi: u32, s: u32, pat: &str) -> String {
     pat.replace("YYYY", &format!("{:04}", y))
         .replace("MM", &format!("{:02}", mo))
         .replace("DD", &format!("{:02}", d))
         .replace("HH", &format!("{:02}", h))
         .replace("mm", &format!("{:02}", mi))
         .replace("ss", &format!("{:02}", s))
+}
+
+// Wall-clock matnni IANA zonada (DST hisobga olinib) talqin qilib UTC sekundga
+// o'giradi. parse_ts asosini (sana+vaqt, mintaqasiz) o'qiydi, so'ng o'sha maydonlarni
+// zonaning local vaqti deb hisoblaydi — fiksrlangan offset emas, shuning uchun
+// yoz/qish (DST) o'tishi to'g'ri ishlaydi.
+//
+// DST chetlari: bahorgi sakrashda mavjud bo'lmagan local vaqt (masalan 02:30) -> None
+// (chaqiruvchi xato beradi). Kuzgi takror (vaqt ikki marta) holatda ertaroq (DST-li)
+// instant tanlanadi — booking uchun deterministik va xavfsiz default.
+fn parse_in_zone(s: &str, zone: &str) -> Option<i64> {
+    use chrono::offset::LocalResult;
+    use chrono::{NaiveDate, TimeZone};
+    let tz: chrono_tz::Tz = zone.parse().ok()?;
+    // parse_ts wall-clock'ni "soxta UTC" sekund sifatida beradi; civil bilan
+    // maydonlarga qaytarib, zonada qayta talqin qilamiz.
+    let (y, mo, d, h, mi, se) = civil(parse_ts(s)?);
+    let naive = NaiveDate::from_ymd_opt(y as i32, mo, d)?.and_hms_opt(h, mi, se)?;
+    match tz.from_local_datetime(&naive) {
+        LocalResult::Single(dt) => Some(dt.timestamp()),
+        LocalResult::Ambiguous(earlier, _later) => Some(earlier.timestamp()),
+        LocalResult::None => None,
+    }
+}
+
+// UTC instant'ni IANA zonaning local wall-clock'iga (DST hisobga olinib) o'tkazib
+// formatlaydi. Noma'lum zona nomida None.
+fn fmt_in_zone(unix: i64, pat: &str, zone: &str) -> Option<String> {
+    use chrono::{Datelike, TimeZone, Timelike, Utc};
+    let tz: chrono_tz::Tz = zone.parse().ok()?;
+    let dt = Utc.timestamp_opt(unix, 0).single()?.with_timezone(&tz);
+    Some(strftime_fields(
+        dt.year() as i64,
+        dt.month(),
+        dt.day(),
+        dt.hour(),
+        dt.minute(),
+        dt.second(),
+        pat,
+    ))
 }
 
 // Oddiy xorshift RNG. Seed system time'dan bir marta olinadi.
@@ -1334,6 +1410,75 @@ mod time_tests {
             ],
         );
         assert!(matches!(r, Ok(Value::Int(1800))));
+    }
+
+    #[test]
+    fn parse_in_zone_is_dst_aware() {
+        // Bir xil wall-clock (12:00 local) DST'da turli UTC offset beradi:
+        // qishda America/New_York = UTC-5 (EST), yozda UTC-4 (EDT). Fiksrlangan
+        // offset DEB hisoblamaslik isboti — issue #80 yadrosi.
+        let winter = parse_in_zone("2026-01-15 12:00:00", "America/New_York").unwrap();
+        assert_eq!(fmt_unix(winter), "2026-01-15 17:00:00"); // EST: +5 UTC
+        let summer = parse_in_zone("2026-07-15 12:00:00", "America/New_York").unwrap();
+        assert_eq!(fmt_unix(summer), "2026-07-15 16:00:00"); // EDT: +4 UTC
+    }
+
+    #[test]
+    fn parse_in_zone_rejects_spring_forward_gap() {
+        // 2026-03-08 02:00 -> 03:00 sakraydi: 02:30 local mavjud emas -> None.
+        assert_eq!(
+            parse_in_zone("2026-03-08 02:30:00", "America/New_York"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_in_zone_rejects_unknown_zone() {
+        assert_eq!(parse_in_zone("2026-01-15 12:00:00", "Mars/Olympus"), None);
+    }
+
+    #[test]
+    fn fmt_in_zone_converts_utc_to_local() {
+        // UTC instant -> zona wall-clock (DST hisobga olinib).
+        let winter = parse_in_zone("2026-01-15 12:00:00", "America/New_York").unwrap();
+        assert_eq!(
+            fmt_in_zone(winter, "YYYY-MM-DD HH:mm", "America/New_York").unwrap(),
+            "2026-01-15 12:00"
+        );
+        // Asia/Tashkent doimiy +5 (DST yo'q) — 17:00 UTC -> 22:00 local.
+        let utc = parse_ts("2026-06-10 17:00:00").unwrap();
+        assert_eq!(fmt_in_zone(utc, "HH:mm", "Asia/Tashkent").unwrap(), "22:00");
+    }
+
+    #[test]
+    fn time_parse_with_zone_module_level() {
+        // time.parse'ning ixtiyoriy 2-argument (zona) yo'li UTC kanonik beradi.
+        let Ok(Value::Str(s)) = time_module(
+            "parse",
+            vec![
+                Value::Str("2026-07-15 09:00:00".into()),
+                Value::Str("America/New_York".into()),
+            ],
+        ) else {
+            panic!("time.parse zona bilan matn qaytarishi kerak");
+        };
+        assert_eq!(s, "2026-07-15 13:00:00"); // EDT (+4) -> UTC
+    }
+
+    #[test]
+    fn time_fmt_with_zone_module_level() {
+        // time.fmt'ning ixtiyoriy 3-argument (zona) local wall-clock beradi.
+        let Ok(Value::Str(s)) = time_module(
+            "fmt",
+            vec![
+                Value::Str("2026-07-15 13:00:00".into()),
+                Value::Str("HH:mm".into()),
+                Value::Str("America/New_York".into()),
+            ],
+        ) else {
+            panic!("time.fmt zona bilan matn qaytarishi kerak");
+        };
+        assert_eq!(s, "09:00"); // 13:00 UTC -> EDT 09:00
     }
 }
 

@@ -875,6 +875,25 @@ time.diff a b          # (a - b) farq sekundda (int); / 60 -> daqiqa
 > r = db.one "select count(*) c from tickets where created > $1" [time.ago 24 :hr]
 > ```
 
+**Davomiylik va interval retseptlari** (interval arifmetikasi BOR — `time.add`/`diff` mavjud):
+```flux
+end_at = time.add start_at dur :min            # davomiylik: start + dur daqiqa
+mins   = (time.diff end_at start_at) / 60       # ikki vaqt orasi -> daqiqa
+overlap = a.start < b.end & a.end > b.start     # ikki interval kesishadimi (bool)
+buf_start = time.sub start_at 15 :min           # buffer: boshidan 15 daqiqa oldin
+```
+
+**IANA zona / DST** — `time.parse` ixtiyoriy zona nomini, `time.fmt` esa 3-argument
+sifatida zonani oladi. Wall-clock ↔ UTC konversiya DST-aware (fiksrlangan offset
+EMAS), shuning uchun "har kuni 09:00 local" yoz/qish o'tishida ham to'g'ri UTC
+instant'ga tushadi:
+```flux
+utc = time.parse "2026-07-15 09:00:00" "Asia/Tashkent"   # local wall-clock -> UTC
+loc = time.fmt utc "HH:mm" "America/New_York"             # UTC instant -> zona wall-clock
+```
+> Bahorgi sakrash oynasidagi wall-clock vaqt (masalan soat sakraydigan tunda `02:30`)
+> mavjud emas — xato beradi; noma'lum zona nomi ham xato beradi.
+
 ### 9.6 `json`
 ```flux
 use json
