@@ -1,9 +1,9 @@
 # Flux Runtime
 
 Flux tilining interpretatori (Rust, tree-walking). **Til yadrosi** va
-`docs/flux-agent.md` da spetsifikatsiyalangan **barcha batareyalar** to'liq
-ishlaydi: `http` (server + klient), `db`, `ai`, `auth`, `ws`, `cron`,
-`queue`, `reg`.
+`docs/flux-agent.md` da spetsifikatsiyalangan **barcha batareyalar** ishlaydi:
+`http` (server + klient), `db`, `ai`, `auth`, `ws`, `cron`, `queue`, `reg`.
+(`db` hozircha faqat SQLite backend; `postgres`/`mysql` stub.)
 
 ## Qurish va ishga tushirish
 

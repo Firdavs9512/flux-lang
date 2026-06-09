@@ -116,8 +116,11 @@ tree-walking interpreter) mavjud — `.fx` fayllarni ishga tushira oladi.
   (JWT + parol hash), **`ws`** (websocket), **`cron`**, **`queue`**, **`reg`**
   (tool registry).
 
-`docs/flux-agent.md` da spetsifikatsiyalangan barcha batareyalar
-implementatsiya qilingan.
+`docs/flux-agent.md` da spetsifikatsiyalangan barcha batareyalar mavjud. Bitta
+eslatma: `db` battery hozircha faqat **SQLite** backend bilan ishlaydi — spec
+uni Postgres deb sarlavhalagan bo'lsa-da, `postgres:`/`mysql:` `DATABASE_URL`
+sxemalari hali stub (xato qaytaradi). Flux `db.*` kodi backend-neytral, shuning
+uchun bu backendlar foydalanuvchi kodini o'zgartirmasdan qo'shiladi.
 
 Ishga tushirish:
 

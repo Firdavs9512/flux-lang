@@ -118,7 +118,11 @@ exists (Rust, tree-walking interpreter) — it can run `.fx` files.
   (JWT + password hashing), **`ws`** (websocket), **`cron`**, **`queue`**,
   **`reg`** (tool registry).
 
-Every battery specified in `docs/flux-agent.md` is implemented.
+Every battery specified in `docs/flux-agent.md` is available. One caveat: the
+`db` battery currently ships only the **SQLite** backend — although the spec
+headlines it as Postgres, `postgres:`/`mysql:` `DATABASE_URL` schemes are still
+stubs (they return an error). Flux `db.*` code is backend-neutral, so those
+backends can be added without changing user code.
 
 Run it:
 
