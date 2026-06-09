@@ -278,26 +278,26 @@ math.floor x · math.ceil x · math.abs x · rand.int a b · rand.str n
 List length `l.len` (member), string length `str.len s` (module).
 
 ### time
-Hamma vaqt — UTC matn `"YYYY-MM-DD HH:MM:SS"` (SQLite `CURRENT_TIMESTAMP` bilan bir xil).
+All times — UTC text `"YYYY-MM-DD HH:MM:SS"` (same as SQLite `CURRENT_TIMESTAMP`).
 ```flux
 time.now · time.ago 24 :hr · time.in 60 :min (:sec :min :hr :day) · time.fmt t "..."
-time.sleep 1 · time.sleep 0.5   # secs kutadi (flt ham) — polling/retry backoff
-time.parse "2026-06-10T10:00:00Z"   # ixtiyoriy ISO matn -> kanonik UTC timestamp ("Z"/"±HH:MM")
-time.add t 30 :min · time.sub t 5 :min   # IXTIYORIY vaqtdan offset (now emas): end_at = start_at + dur
-time.diff a b                       # (a - b) sekundda (int); / 60 -> daqiqa
+time.sleep 1 · time.sleep 0.5   # waits secs (flt too) — polling/retry backoff
+time.parse "2026-06-10T10:00:00Z"   # arbitrary ISO text -> canonical UTC timestamp ("Z"/"±HH:MM")
+time.add t 30 :min · time.sub t 5 :min   # offset from ANY time (not now): end_at = start_at + dur
+time.diff a b                       # (a - b) in seconds (int); / 60 -> minutes
 db.one "select count(*) c from t where created > $1" [time.ago 24 :hr]
 ```
-**Davomiylik/interval retseptlari** (interval arifmetikasi MAVJUD — `time.add`/`diff` bor):
+**Duration/interval recipes** (interval arithmetic EXISTS — `time.add`/`diff` are here):
 ```flux
-end_at = time.add start_at dur :min          # davomiylik: start + dur daqiqa
-mins   = (time.diff end_at start_at) / 60     # ikki vaqt orasi -> daqiqa
-overlap = a.start < b.end & a.end > b.start   # ikki interval kesishadimi (bool)
-buf_start = time.sub start_at 15 :min         # buffer: boshidan 15 daqiqa oldin
+end_at = time.add start_at dur :min          # duration: start + dur minutes
+mins   = (time.diff end_at start_at) / 60     # gap between two times -> minutes
+overlap = a.start < b.end & a.end > b.start   # do two intervals overlap? (bool)
+buf_start = time.sub start_at 15 :min         # buffer: 15 min before start
 ```
-**IANA zona / DST** — `time.parse`/`time.fmt` ixtiyoriy zona argument oladi (fiksrlangan offset EMAS):
+**IANA timezone / DST** — `time.parse`/`time.fmt` take an optional zone arg (NOT a fixed offset):
 ```flux
 utc = time.parse "2026-07-15 09:00:00" "Asia/Tashkent"  # local wall-clock -> UTC (DST-aware)
-loc = time.fmt utc "HH:mm" "America/New_York"            # UTC instant -> zona wall-clock
+loc = time.fmt utc "HH:mm" "America/New_York"            # UTC instant -> zone wall-clock
 ```
 
 ### json / env / log
