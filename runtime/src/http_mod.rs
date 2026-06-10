@@ -344,9 +344,20 @@ fn with_ctx(req: Value, ctx: Arc<Mutex<BTreeMap<String, Value>>>) -> Value {
 
 // --- Value/Flow -> hyper::Response ---
 
+// Status kodni StatusCode'ga aylantiradi. Noto'g'ri kod (masalan `rep 1000 ...`,
+// yoki manfiy status `*n as u16` wrap natijasi) jim `200 OK` ga tushmasligi
+// kerak (issue #108): handler xato status qaytarmoqchi bo'lganda mijoz
+// muvaffaqiyat ko'rmasin. Buzuq statusni 500 ga aylantirib log yozamiz.
+fn status_or_500(status: u16) -> StatusCode {
+    StatusCode::from_u16(status).unwrap_or_else(|_| {
+        eprintln!("Flux HTTP: noto'g'ri status kodi {} → 500", status);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
 fn json_response(status: u16, body: String) -> Response<Full<Bytes>> {
     Response::builder()
-        .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK))
+        .status(status_or_500(status))
         .header("content-type", "application/json")
         .body(Full::new(Bytes::from(body)))
         .unwrap()
@@ -354,7 +365,7 @@ fn json_response(status: u16, body: String) -> Response<Full<Bytes>> {
 
 fn text_response(status: u16, body: String) -> Response<Full<Bytes>> {
     Response::builder()
-        .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK))
+        .status(status_or_500(status))
         .header("content-type", "text/plain; charset=utf-8")
         .body(Full::new(Bytes::from(body)))
         .unwrap()
@@ -471,7 +482,7 @@ fn apply_headers_mut(hmap: &mut hyper::HeaderMap, headers: Option<&Value>) {
 fn body_value_to_response(status: u16, body: Value) -> Response<Full<Bytes>> {
     match body {
         Value::Nil => Response::builder()
-            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK))
+            .status(status_or_500(status))
             .body(Full::new(Bytes::new()))
             .unwrap(),
         Value::Str(s) => text_response(status, s),
@@ -659,18 +670,23 @@ impl Interp {
     }
 }
 
-// Bitta HTTP server uchun accept loop — umumiy event-loop ichida spawn qilinadi
-// (`serve_mod`). Port bind'ni shu yerda bajaradi (deferred: top-level tugagandan
-// keyin), shuning uchun bind xatosi shu loopda chiqadi.
-pub async fn serve_loop(interp: Arc<Interp>, port: u16) {
+// Port'ni bind qiladi (deferred: top-level tugagandan keyin, `serve_mod`).
+// Bind xatosini `Flow::Error` sifatida qaytaradi — `run_pending` uni yuqoriga
+// ko'taradi, shunda port band bo'lsa jarayon exit code ≠ 0 bilan tugaydi
+// (issue #108: deploy/supervisor xatoni sezsin). Accept loop'dan oldin
+// chaqiriladi, shuning uchun bind muvaffaqiyatsizligi spawn'dan oldin chiqadi.
+pub async fn bind(port: u16) -> Result<TcpListener, Flow> {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let listener = match TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("Flux HTTP port {} bind xatosi: {}", port, e);
-            return;
-        }
-    };
+    TcpListener::bind(addr)
+        .await
+        .map_err(|e| Flow::err(format!("Flux HTTP port {} bind xatosi: {}", port, e)))
+}
+
+// Bitta HTTP server uchun accept loop — umumiy event-loop ichida spawn qilinadi
+// (`serve_mod`). Listener oldindan `bind` bilan ochilgan (bind xatosi spawn'dan
+// oldin ko'tariladi).
+pub async fn serve_loop(interp: Arc<Interp>, listener: TcpListener) {
+    let port = listener.local_addr().map(|a| a.port()).unwrap_or_default();
     eprintln!("Flux HTTP server: http://localhost:{}", port);
 
     loop {
@@ -1462,6 +1478,30 @@ mod tests {
     }
 
     #[test]
+    fn notogri_status_500_ga_tushadi() {
+        // `rep 1000 ...` — yaroqsiz HTTP status. Jim 200 ga tushmasligi kerak
+        // (issue #108): handler xato status qaytarganda mijoz muvaffaqiyat
+        // ko'rmasin. 1000 HTTP diapazonidan tashqarida → 500.
+        let r = value_to_response(resp_map(1000, Value::Str("xato".into()), None));
+        assert_eq!(r.status().as_u16(), 500);
+    }
+
+    #[test]
+    fn manfiy_status_500_ga_tushadi() {
+        // Manfiy status `*n as u16` bilan wrap bo'ladi (-1 → 65535) — bu ham
+        // yaroqsiz, 500 ga tushadi (issue #108), 200 ga emas.
+        let r = value_to_response(resp_map(-1, Value::Nil, None));
+        assert_eq!(r.status().as_u16(), 500);
+    }
+
+    #[test]
+    fn yaroqli_status_saqlanadi() {
+        // Yaroqli status (404) o'zgartirilmaydi — fix faqat buzuq statusга tegadi.
+        let r = value_to_response(resp_map(404, Value::Str("topilmadi".into()), None));
+        assert_eq!(r.status().as_u16(), 404);
+    }
+
+    #[test]
     fn buzuq_header_jim_otkaziladi() {
         // Yaroqsiz header qiymati (yangi qator) butun javobni buzmaydi —
         // jim o'tkazib yuboriladi, qolgan header'lar o'rnatiladi.
@@ -1475,6 +1515,22 @@ mod tests {
         ));
         assert!(r.headers().get("x-bad").is_none());
         assert_eq!(r.headers().get("x-good").unwrap(), "yaxshi");
+    }
+
+    #[tokio::test]
+    async fn band_port_bind_xato_qaytaradi() {
+        // Port band bo'lsa bind `Err` qaytaradi (issue #108) — jim `return` emas.
+        // Avval portni egallaymiz (0 → OS bo'sh port tanlaydi), so'ng o'sha
+        // portga qayta bind urinamiz: aynan bir xil addr → EADDRINUSE.
+        let Ok(occupied) = bind(0).await else {
+            panic!("bo'sh portga bind bo'lishi kerak");
+        };
+        let port = occupied.local_addr().unwrap().port();
+        let res = bind(port).await;
+        assert!(
+            matches!(res, Err(Flow::Error(_))),
+            "band port → Err kutilgan"
+        );
     }
 
     // --- rate-limit (issue #79) ---
