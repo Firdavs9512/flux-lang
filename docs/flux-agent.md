@@ -275,18 +275,22 @@ Provider auto-detected from env (OS env > .env), nothing to configure:
 
 `ai.run` — ONE step of a tool-loop (doesn't execute; returns what it wants to do;
 the loop is yours → logging/cost/approval control). Returns one of:
-`{kind::final text}` or `{kind::call tool args id}`.
+`{kind::final text}` or `{kind::call tool args id calls:[{tool args id} ...]}`.
+The model may call several tools in parallel → all are in `calls`; `tool/args/id`
+mirror `calls[0]` (back-compat). Return a tool result for EACH call, else the
+next request 400s (a missing tool_use_id has no tool_result).
 ```flux
 msgs <- [{role::user content:text}]
 each i in 1..10
   r = ai.run msgs tools                # tools: [{name desc params}]
   if r.kind == :final
     ret r.text
-  # r.kind == :call → model wants a tool
-  out = reg.call r.tool r.args         # run the tool by name
-  # feed back: assistant tool_use + tool result (id ties them)
-  msgs <- msgs.push {role::assistant content:[{type:"tool_use" id:r.id name:r.tool input:r.args}]}
-  msgs <- msgs.push {role::tool id:r.id content:(json.enc out)}
+  # r.kind == :call → model wants tools; iterate every call
+  each c in r.calls
+    out = reg.call c.tool c.args        # run the tool by name
+    # feed back: assistant tool_use + tool result (id ties them)
+    msgs <- msgs.push {role::assistant content:[{type:"tool_use" id:c.id name:c.tool input:c.args}]}
+    msgs <- msgs.push {role::tool id:c.id content:(json.enc out)}
 ```
 
 ### auth (JWT + password hash, $AUTH_SECRET auto)
