@@ -893,6 +893,9 @@ rand.int 1 100         # a random integer in the range 1..100
 rand.str 6             # a random string of 6 characters (ideal for short codes)
 ```
 
+> `rand` reads from the OS CSPRNG (operating-system entropy), so `rand.str` is
+> safe for token/session-ID generation too — the values are not predictable.
+
 **`time` — time and date:**
 ```flux
 time.now               # the current time (timestamp)

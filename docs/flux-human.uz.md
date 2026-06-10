@@ -899,6 +899,10 @@ rand.int 1 100         # 1..100 oralig'ida tasodifiy butun son
 rand.str 6             # 6 ta belgili tasodifiy satr (qisqa kod uchun ideal)
 ```
 
+> `rand` OS CSPRNG'dan (operatsion tizim entropiyasi) o'qiydi, shuning uchun
+> `rand.str` token/session-ID generatsiya uchun ham xavfsiz — qiymat bashorat
+> qilinmaydi.
+
 **`time` — vaqt va sana:**
 ```flux
 time.now               # hozirgi vaqt (timestamp)

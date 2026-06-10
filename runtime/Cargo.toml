@@ -44,3 +44,8 @@ base64 = "0.22"
 # auth battery: parol hash (argon2id — bcrypt'dan afzal, default xavfsiz).
 # Salt avtomatik (PHC string ichida), `auth.check` doimiy-vaqt taqqoslash.
 argon2 = "0.5"
+# rand battery: OS CSPRNG (getrandom). `rand.str` backend'da token/session-ID
+# uchun ishlatiladi, shuning uchun vaqt-seed'li xorshift emas, OS entropiyasidan
+# o'qiymiz (auth battery ham OsRng ishlatadi). Bashorat qilinmas, thread-larda
+# bir xil ketma-ketlik bermaydi.
+getrandom = "0.2"
