@@ -1157,11 +1157,24 @@ fn http_client(method: &str, args: Vec<Value>, has_body: bool) -> Result<Value, 
             // method redirect'da o'zgarishi mumkin (303 va GET-aylantiruvchi 301/302).
             let mut cur_method = method.to_string();
             let mut hops: i64 = 0;
+            // Asl so'rov origin'i (sxema, host, port). Redirect begona origin'ga
+            // olib chiqsa credential header'lar yuborilmaydi (issue #96).
+            let mut first_origin: Option<(String, String, u16)> = None;
+            // Belgi yopishqoq: begona origin orqali asl host'ga qaytsa ham
+            // credential tiklanmaydi (reqwest/curl bilan bir xil ehtiyotkorlik).
+            let mut cross_origin = false;
 
             loop {
                 let uri: hyper::Uri = current
                     .parse()
                     .map_err(|e| Flow::err(format!("noto'g'ri url: {}", e)))?;
+
+                let this_origin = uri_origin(&uri);
+                match &first_origin {
+                    None => first_origin = Some(this_origin),
+                    Some(o) if *o != this_origin => cross_origin = true,
+                    _ => {}
+                }
 
                 // GET'ga aylangach tana yuborilmaydi.
                 let send_body = cur_method != "GET" && cur_method != "DELETE";
@@ -1170,6 +1183,11 @@ fn http_client(method: &str, args: Vec<Value>, has_body: bool) -> Result<Value, 
                 // foydalanuvchi o'zi bergan bo'lsa, avtomatik qiymat ustiga yozmaymiz.
                 let mut has_user_ct = false;
                 for (k, v) in &opts.headers {
+                    // Cross-origin redirect: Authorization/x-api-key/Cookie begona
+                    // host'ga sizib chiqmasin (issue #96).
+                    if cross_origin && is_sensitive_header(k) {
+                        continue;
+                    }
                     if k.eq_ignore_ascii_case("content-type") {
                         has_user_ct = true;
                     }
@@ -1217,6 +1235,9 @@ fn http_client(method: &str, args: Vec<Value>, has_body: bool) -> Result<Value, 
                     if status == 303 || ((status == 301 || status == 302) && cur_method == "POST") {
                         cur_method = "GET".to_string();
                     }
+                    // 3xx tanasini drain qilamiz — o'qilmagan body bilan hyper
+                    // pool ulanishni qayta ishlata olmaydi (issue #96).
+                    let _ = resp.into_body().collect().await;
                     continue;
                 }
 
@@ -1283,8 +1304,23 @@ fn resolve_location(base: &str, loc: &str) -> String {
     if loc.starts_with("http://") || loc.starts_with("https://") {
         return loc.to_string();
     }
-    // base'dan sxema://host qismini ajratamiz.
+    // base'dan sxema://host qismini ajratamiz. Query/fragment'ni avval kesamiz —
+    // ulardagi `/` yo'l segmenti hisoblanmasin (masalan `?q=/z`, issue #96).
     let scheme_end = base.find("://").map(|i| i + 3).unwrap_or(0);
+    let base_end = base[scheme_end..]
+        .find(['?', '#'])
+        .map(|i| scheme_end + i)
+        .unwrap_or(base.len());
+    let base = &base[..base_end];
+    // Sxema-nisbiy `//host/yo'l` — base sxemasi saqlanadi, qolgani Location'dan.
+    if let Some(rest) = loc.strip_prefix("//") {
+        let scheme = if scheme_end >= 3 {
+            &base[..scheme_end - 2]
+        } else {
+            "http:"
+        };
+        return format!("{}//{}", scheme, rest);
+    }
     let host_end = base[scheme_end..]
         .find('/')
         .map(|i| scheme_end + i)
@@ -1293,14 +1329,36 @@ fn resolve_location(base: &str, loc: &str) -> String {
     if loc.starts_with('/') {
         format!("{}{}", origin, loc)
     } else {
-        // nisbiy yo'l: joriy yo'lning oxirgi segmentini almashtiramiz.
+        // nisbiy yo'l: joriy yo'lning oxirgi segmentini almashtiramiz. Yo'l
+        // umuman bo'lmasa root deb qaraladi — `/` qo'shiladi (issue #96:
+        // ilgari "http://a.com" + "page" → "http://a.compage" chiqardi).
         let path_part = &base[host_end..];
-        let dir_end = path_part
-            .rfind('/')
-            .map(|i| host_end + i + 1)
-            .unwrap_or(base.len());
-        format!("{}{}", &base[..dir_end], loc)
+        match path_part.rfind('/') {
+            Some(i) => format!("{}{}", &base[..host_end + i + 1], loc),
+            None => format!("{}/{}", origin, loc),
+        }
     }
+}
+
+// Origin (sxema, host, port) uchligi — redirect host/port/sxemani o'zgartirganini
+// aniqlash uchun. Port berilmagan bo'lsa sxema standarti olinadi (http=80,
+// https=443): `http://a.com` va `http://a.com:80` bir origin.
+fn uri_origin(uri: &hyper::Uri) -> (String, String, u16) {
+    let scheme = uri.scheme_str().unwrap_or("http").to_ascii_lowercase();
+    let host = uri.host().unwrap_or("").to_ascii_lowercase();
+    let port = uri
+        .port_u16()
+        .unwrap_or(if scheme == "https" { 443 } else { 80 });
+    (scheme, host, port)
+}
+
+// Cross-origin redirect'da tushirib yuboriladigan credential header'lar —
+// curl/reqwest xulqi bilan bir xil: begona host API kalit/sessiyani ko'rmasin.
+fn is_sensitive_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("authorization")
+        || name.eq_ignore_ascii_case("proxy-authorization")
+        || name.eq_ignore_ascii_case("cookie")
+        || name.eq_ignore_ascii_case("x-api-key")
 }
 
 #[cfg(test)]
@@ -1330,9 +1388,154 @@ mod tests {
 
     #[test]
     fn location_relative_at_root() {
-        // host'dan keyin yo'l yo'q bo'lsa, nisbiy yo'l to'g'ridan-to'g'ri ulanadi.
+        // host'dan keyin yo'l yo'q bo'lsa root deb qaraladi — `/` qo'shiladi
+        // (issue #96: ilgari "http://a.compage" degan buzuq URL chiqardi).
         let got = resolve_location("http://a.com", "page");
-        assert_eq!(got, "http://a.compage");
+        assert_eq!(got, "http://a.com/page");
+    }
+
+    #[test]
+    fn location_base_query_kesiladi() {
+        // Base query'sidagi `/` yo'l segmenti emas (issue #96) — nisbiy yo'l
+        // query'dan oldingi haqiqiy yo'lga nisbatan hal qilinadi.
+        let got = resolve_location("http://a.com/search?q=/z", "next");
+        assert_eq!(got, "http://a.com/next");
+        // Mutlaq yo'lda ham query origin'ni buzmaydi.
+        let got2 = resolve_location("http://a.com/a/b?x=1", "/new");
+        assert_eq!(got2, "http://a.com/new");
+    }
+
+    #[test]
+    fn location_scheme_relative() {
+        // `//host/yo'l` — sxema base'dan olinadi (https saqlanadi).
+        let got = resolve_location("https://a.com/x", "//b.com/y");
+        assert_eq!(got, "https://b.com/y");
+    }
+
+    #[test]
+    fn origin_default_port_va_case() {
+        // Standart port yozilgan-yozilmagani va harf katta-kichikligi farq qilmaydi.
+        let a: hyper::Uri = "http://A.com/x".parse().unwrap();
+        let b: hyper::Uri = "http://a.com:80/y".parse().unwrap();
+        assert_eq!(uri_origin(&a), uri_origin(&b));
+        // Sxema yoki port farqi — boshqa origin (credential ketmasligi kerak).
+        let c: hyper::Uri = "https://a.com/x".parse().unwrap();
+        let d: hyper::Uri = "http://a.com:8080/x".parse().unwrap();
+        assert_ne!(uri_origin(&a), uri_origin(&c));
+        assert_ne!(uri_origin(&a), uri_origin(&d));
+    }
+
+    #[test]
+    fn sensitive_header_royxati() {
+        // Credential header'lar case-insensitive taniladi; oddiy header emas.
+        assert!(is_sensitive_header("Authorization"));
+        assert!(is_sensitive_header("X-API-Key"));
+        assert!(is_sensitive_header("cookie"));
+        assert!(is_sensitive_header("Proxy-Authorization"));
+        assert!(!is_sensitive_header("content-type"));
+        assert!(!is_sensitive_header("x-request-id"));
+    }
+
+    // Mini HTTP server: `responses` dagi har bir javob uchun bitta ulanish qabul
+    // qiladi va kelgan so'rov matnini qayd etadi. `Connection: close` bilan javob
+    // berilishi shart — har hop yangi ulanishda kelib, qaydlar deterministik bo'ladi.
+    fn spawn_test_server(responses: Vec<String>) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let mut captured = Vec::new();
+            for resp in responses {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                loop {
+                    let n = sock.read(&mut tmp).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                captured.push(String::from_utf8_lossy(&buf).to_string());
+                sock.write_all(resp.as_bytes()).unwrap();
+            }
+            captured
+        });
+        (port, handle)
+    }
+
+    // follow:true + credential header'lar bilan GET so'rovini quradi.
+    fn follow_get_with_credentials(url: String) -> Result<Value, Flow> {
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            "authorization".to_string(),
+            Value::Str("Bearer sekret".into()),
+        );
+        headers.insert("x-api-key".to_string(), Value::Str("kalit".into()));
+        headers.insert("x-custom".to_string(), Value::Str("qoladi".into()));
+        let mut opts = BTreeMap::new();
+        opts.insert("follow".to_string(), Value::Bool(true));
+        opts.insert("headers".to_string(), Value::Map(headers));
+        http_client("GET", vec![Value::Str(url), Value::Map(opts)], false)
+    }
+
+    #[test]
+    fn cross_origin_redirect_credential_tushiriladi() {
+        // issue #96: begona origin'ga (boshqa port) redirect — Authorization va
+        // x-api-key u yerga yetib bormasligi kerak, oddiy header esa qoladi.
+        let (port_b, hb) = spawn_test_server(vec![
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok".to_string(),
+        ]);
+        let (port_a, ha) = spawn_test_server(vec![format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{}/dest\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+            port_b
+        )]);
+
+        let Ok(Value::Map(res)) =
+            follow_get_with_credentials(format!("http://127.0.0.1:{}/start", port_a))
+        else {
+            panic!("so'rov muvaffaqiyatli bo'lishi kerak edi");
+        };
+        assert!(matches!(res.get("status"), Some(Value::Int(200))));
+
+        // Birinchi host (asl origin) credential'larni to'liq oladi.
+        let req_a = ha.join().unwrap().remove(0).to_lowercase();
+        assert!(req_a.contains("authorization: bearer sekret"));
+        assert!(req_a.contains("x-api-key: kalit"));
+        // Begona host'ga credential'lar ketmaydi, oddiy header esa boradi.
+        let req_b = hb.join().unwrap().remove(0).to_lowercase();
+        assert!(
+            !req_b.contains("authorization"),
+            "Authorization sizib chiqdi"
+        );
+        assert!(!req_b.contains("x-api-key"), "x-api-key sizib chiqdi");
+        assert!(req_b.contains("x-custom: qoladi"));
+    }
+
+    #[test]
+    fn same_origin_redirect_credential_saqlanadi() {
+        // Bir xil origin ichidagi redirect'da credential'lar tushirilmaydi —
+        // fix faqat begona host'ga ta'sir qiladi.
+        let (port, h) = spawn_test_server(vec![
+            "HTTP/1.1 302 Found\r\nLocation: /dest\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                .to_string(),
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok".to_string(),
+        ]);
+
+        let Ok(Value::Map(res)) =
+            follow_get_with_credentials(format!("http://127.0.0.1:{}/start", port))
+        else {
+            panic!("so'rov muvaffaqiyatli bo'lishi kerak edi");
+        };
+        assert!(matches!(res.get("status"), Some(Value::Int(200))));
+
+        let captured = h.join().unwrap();
+        let req2 = captured[1].to_lowercase();
+        assert!(req2.contains("authorization: bearer sekret"));
+        assert!(req2.contains("x-api-key: kalit"));
     }
 
     #[test]
