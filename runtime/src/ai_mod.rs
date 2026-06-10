@@ -224,7 +224,10 @@ impl Interp {
     //   tools: [{name desc params} ...]        (params — JSON-schema map)
     // Natija (kind nomi spec'dan — docs/flux-human.md):
     //   :final -> {kind::final text:str}
-    //   :call  -> {kind::call tool:str args:map id:str}
+    //   :call  -> {kind::call tool:str args:map id:str calls:[{tool args id} ...]}
+    // Model parallel bir nechta tool chaqirsa, hammasi `calls` ro'yxatida bo'ladi
+    // (har biriga tool_result qaytarish kerak). `tool`/`args`/`id` esa orqaga
+    // moslik uchun birinchi chaqiruv — `calls`'ning [0] elementi bilan bir xil.
     // (tool'ni O'ZI bajarmaydi — loop foydalanuvchi qo'lida.)
     fn ai_run(&self, args: Vec<Value>) -> Result<Value, Flow> {
         let msgs = match args.first() {
@@ -248,11 +251,26 @@ impl Interp {
         let resp = self.call_api(&api_msgs, None, api_tools.as_ref())?;
 
         let mut out = BTreeMap::new();
-        if let Some((tool, input, id)) = resp.tool_use {
+        if !resp.tool_calls.is_empty() {
             out.insert("kind".to_string(), Value::Sym("call".to_string()));
-            out.insert("tool".to_string(), Value::Str(tool));
-            out.insert("args".to_string(), input);
-            out.insert("id".to_string(), Value::Str(id));
+            // Har chaqiruvni {tool args id} map'ga aylantiramiz.
+            let calls: Vec<Value> = resp
+                .tool_calls
+                .iter()
+                .map(|(tool, input, id)| {
+                    let mut c = BTreeMap::new();
+                    c.insert("tool".to_string(), Value::Str(tool.clone()));
+                    c.insert("args".to_string(), input.clone());
+                    c.insert("id".to_string(), Value::Str(id.clone()));
+                    Value::Map(c)
+                })
+                .collect();
+            // Orqaga moslik: birinchi chaqiruv top-level `tool`/`args`/`id`.
+            let (tool, input, id) = &resp.tool_calls[0];
+            out.insert("tool".to_string(), Value::Str(tool.clone()));
+            out.insert("args".to_string(), input.clone());
+            out.insert("id".to_string(), Value::Str(id.clone()));
+            out.insert("calls".to_string(), Value::List(calls));
         } else {
             out.insert("kind".to_string(), Value::Sym("final".to_string()));
             out.insert("text".to_string(), Value::Str(resp.text));
@@ -395,7 +413,9 @@ where
 struct AiResp {
     text: String,
     // (tool_name, input_map, tool_use_id) — model tool chaqirmoqchi bo'lsa.
-    tool_use: Option<(String, Value, String)>,
+    // Vec: model bitta javobda BIR NECHTA tool'ni parallel chaqirishi mumkin —
+    // hammasini yig'amiz, aks holda yo'qolgan tool_use_id keyingi so'rovda 400 beradi.
+    tool_calls: Vec<(String, Value, String)>,
     in_tokens: i64,
     out_tokens: i64,
     model: String,
@@ -446,8 +466,11 @@ fn parse_anthropic(text: &str, model: &str, ms: i64) -> Result<AiResp, Flow> {
     };
 
     // content: [{type:"text" text:...} | {type:"tool_use" name input id} ...]
+    // Model parallel ravishda bir nechta tool_use blok qaytarishi mumkin —
+    // hammasini yig'amiz (faqat oxirgisini saqlasak qolganlari uchun keyingi
+    // so'rovda tool_result bo'lmaydi va Anthropic API 400 qaytaradi).
     let mut out_text = String::new();
-    let mut tool_use = None;
+    let mut tool_calls = Vec::new();
     if let Some(Value::List(blocks)) = map.get("content") {
         for block in blocks {
             if let Value::Map(b) = block {
@@ -464,7 +487,7 @@ fn parse_anthropic(text: &str, model: &str, ms: i64) -> Result<AiResp, Flow> {
                             .cloned()
                             .unwrap_or(Value::Map(BTreeMap::new()));
                         let id = b.get("id").and_then(as_str).unwrap_or_default();
-                        tool_use = Some((name, input, id));
+                        tool_calls.push((name, input, id));
                     }
                     _ => {}
                 }
@@ -474,7 +497,7 @@ fn parse_anthropic(text: &str, model: &str, ms: i64) -> Result<AiResp, Flow> {
 
     Ok(AiResp {
         text: out_text,
-        tool_use,
+        tool_calls,
         in_tokens,
         out_tokens,
         model: model.to_string(),
@@ -535,31 +558,32 @@ fn parse_openai(text: &str, model: &str, ms: i64) -> Result<AiResp, Flow> {
     // content (null bo'lishi mumkin tool_calls bo'lganda).
     let out_text = message.get("content").and_then(as_str).unwrap_or_default();
 
-    // tool_calls[0] -> (name, args_map, id). arguments JSON-string -> map.
-    let tool_use = match message.get("tool_calls") {
-        Some(Value::List(tc)) if !tc.is_empty() => match &tc[0] {
-            Value::Map(call) => {
-                let id = call.get("id").and_then(as_str).unwrap_or_default();
-                let func = match call.get("function") {
-                    Some(Value::Map(f)) => f,
-                    _ => return Err(Flow::err("ai: OpenAI tool_call.function yo'q".to_string())),
-                };
-                let name = func.get("name").and_then(as_str).unwrap_or_default();
-                // arguments — JSON-kodlangan string; map'ga parse qilamiz.
-                let args = match func.get("arguments").and_then(as_str) {
-                    Some(s) => json_decode(&s).unwrap_or(Value::Map(BTreeMap::new())),
-                    None => Value::Map(BTreeMap::new()),
-                };
-                Some((name, args, id))
-            }
-            _ => None,
-        },
-        _ => None,
-    };
+    // tool_calls[] -> [(name, args_map, id)]. arguments JSON-string -> map.
+    // Model bir javobda bir nechta tool chaqirishi mumkin — hammasini yig'amiz
+    // (faqat tc[0] ni olsak qolganlari uchun tool natijasi qaytmaydi va keyingi
+    // so'rov 400 oladi).
+    let mut tool_calls = Vec::new();
+    if let Some(Value::List(tc)) = message.get("tool_calls") {
+        for call in tc {
+            let Value::Map(call) = call else { continue };
+            let id = call.get("id").and_then(as_str).unwrap_or_default();
+            let func = match call.get("function") {
+                Some(Value::Map(f)) => f,
+                _ => return Err(Flow::err("ai: OpenAI tool_call.function yo'q".to_string())),
+            };
+            let name = func.get("name").and_then(as_str).unwrap_or_default();
+            // arguments — JSON-kodlangan string; map'ga parse qilamiz.
+            let args = match func.get("arguments").and_then(as_str) {
+                Some(s) => json_decode(&s).unwrap_or(Value::Map(BTreeMap::new())),
+                None => Value::Map(BTreeMap::new()),
+            };
+            tool_calls.push((name, args, id));
+        }
+    }
 
     Ok(AiResp {
         text: out_text,
-        tool_use,
+        tool_calls,
         in_tokens,
         out_tokens,
         model: model.to_string(),
@@ -1129,7 +1153,7 @@ mod tests {
             Err(_) => panic!("parse muvaffaqiyatsiz"),
         };
         assert_eq!(r.text, "javob");
-        assert!(r.tool_use.is_none());
+        assert!(r.tool_calls.is_empty());
         assert_eq!(r.in_tokens, 10);
         assert_eq!(r.out_tokens, 5);
         assert!((r.conf - 0.9).abs() < 1e-9);
@@ -1149,7 +1173,8 @@ mod tests {
             Ok(r) => r,
             Err(_) => panic!("parse muvaffaqiyatsiz"),
         };
-        let (name, input, id) = r.tool_use.unwrap();
+        assert_eq!(r.tool_calls.len(), 1);
+        let (name, input, id) = &r.tool_calls[0];
         assert_eq!(name, "weather");
         assert_eq!(id, "toolu_9");
         match input {
@@ -1161,10 +1186,33 @@ mod tests {
     }
 
     #[test]
+    fn parse_parallel_tool_use() {
+        // Model bir javobda IKKI tool chaqirsa, ikkalasi ham yig'iladi
+        // (issue #95 — ilgari faqat oxirgisi qolardi).
+        let json = r#"{
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 20, "output_tokens": 8},
+            "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "weather", "input": {"city": "Toshkent"}},
+                {"type": "tool_use", "id": "toolu_2", "name": "time", "input": {"tz": "UTC"}}
+            ]
+        }"#;
+        let r = match parse_anthropic(json, "claude-opus-4-8", 50) {
+            Ok(r) => r,
+            Err(_) => panic!("parse muvaffaqiyatsiz"),
+        };
+        assert_eq!(r.tool_calls.len(), 2);
+        assert_eq!(r.tool_calls[0].0, "weather");
+        assert_eq!(r.tool_calls[0].2, "toolu_1");
+        assert_eq!(r.tool_calls[1].0, "time");
+        assert_eq!(r.tool_calls[1].2, "toolu_2");
+    }
+
+    #[test]
     fn meta_fields() {
         let r = AiResp {
             text: "x".to_string(),
-            tool_use: None,
+            tool_calls: Vec::new(),
             in_tokens: 1000,
             out_tokens: 500,
             model: "claude-opus-4-8".to_string(),
@@ -1206,7 +1254,7 @@ mod tests {
             Err(_) => panic!("openai parse muvaffaqiyatsiz"),
         };
         assert_eq!(r.text, "salom");
-        assert!(r.tool_use.is_none());
+        assert!(r.tool_calls.is_empty());
         assert_eq!(r.in_tokens, 12);
         assert_eq!(r.out_tokens, 4);
     }
@@ -1233,7 +1281,8 @@ mod tests {
             Ok(r) => r,
             Err(_) => panic!("openai tool parse muvaffaqiyatsiz"),
         };
-        let (name, input, id) = r.tool_use.unwrap();
+        assert_eq!(r.tool_calls.len(), 1);
+        let (name, input, id) = &r.tool_calls[0];
         assert_eq!(name, "ob_havo");
         assert_eq!(id, "call_7");
         match input {
@@ -1245,6 +1294,37 @@ mod tests {
             }
             _ => panic!("args map kutilgan"),
         }
+    }
+
+    #[test]
+    fn parse_openai_parallel_tool_calls() {
+        // OpenAI ham bir javobda bir nechta tool_call qaytarishi mumkin —
+        // hammasi yig'iladi (issue #95).
+        let json = r#"{
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {"id": "call_1", "type": "function",
+                         "function": {"name": "ob_havo", "arguments": "{\"shahar\":\"Toshkent\"}"}},
+                        {"id": "call_2", "type": "function",
+                         "function": {"name": "vaqt", "arguments": "{\"tz\":\"UTC\"}"}}
+                    ]
+                }
+            }],
+            "usage": {"prompt_tokens": 30, "completion_tokens": 9}
+        }"#;
+        let r = match parse_openai(json, "gpt-4o", 60) {
+            Ok(r) => r,
+            Err(_) => panic!("openai parallel parse muvaffaqiyatsiz"),
+        };
+        assert_eq!(r.tool_calls.len(), 2);
+        assert_eq!(r.tool_calls[0].0, "ob_havo");
+        assert_eq!(r.tool_calls[0].2, "call_1");
+        assert_eq!(r.tool_calls[1].0, "vaqt");
+        assert_eq!(r.tool_calls[1].2, "call_2");
     }
 
     #[test]
