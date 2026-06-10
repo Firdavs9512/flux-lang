@@ -20,17 +20,24 @@ use tokio_tungstenite::tungstenite::Message;
 // Berilgan port uchun ws skriptini vaqtinchalik faylga yozib, flux serverini
 // ishga tushiradi. Serverni o'chirish uchun `Child` qaytaradi.
 fn spawn_server(port: u16, script: &str) -> (Child, std::path::PathBuf) {
+    spawn_server_env(port, script, &[])
+}
+
+// `spawn_server` ning env o'zgaruvchilarini beradigan varianti. Env faqat shu
+// subprocess'ga ta'sir qiladi (boshqa testlar bilan poyga yo'q).
+fn spawn_server_env(port: u16, script: &str, env: &[(&str, &str)]) -> (Child, std::path::PathBuf) {
     let path = std::env::temp_dir().join(format!("flux_ws_test_{}.fx", port));
     let mut f = std::fs::File::create(&path).expect("temp fx yaratish");
     f.write_all(script.as_bytes()).expect("temp fx yozish");
     drop(f);
 
     let bin = env!("CARGO_BIN_EXE_flux");
-    let child = Command::new(bin)
-        .arg("run")
-        .arg(&path)
-        .spawn()
-        .expect("flux serverini ishga tushirish");
+    let mut cmd = Command::new(bin);
+    cmd.arg("run").arg(&path);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let child = cmd.spawn().expect("flux serverini ishga tushirish");
     (child, path)
 }
 
@@ -281,6 +288,48 @@ async fn cron_run_does_not_block_http_serve() {
         "server javobi: {}",
         resp
     );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+// Server o'zi davriy ping yuboradi — half-open (o'lik) ulanishlarni aniqlash
+// uchun (issue #107). Ping oralig'ini `FLUX_WS_PING_SECS=1` bilan tezlashtiramiz
+// va klient ~1s ichida Ping frame'ini olishini tekshiramiz.
+const PING_SCRIPT: &str = r#"
+use ws
+
+ws.on :connect \conn ->
+  log "ulandi"
+
+ws.serve PORT
+"#;
+
+#[tokio::test]
+async fn server_sends_periodic_ping() {
+    let port = 9315;
+    let script = PING_SCRIPT.replace("PORT", &port.to_string());
+    let (child, path) = spawn_server_env(port, &script, &[("FLUX_WS_PING_SECS", "1")]);
+    let _killer = Killer(child);
+    wait_port(port).await;
+
+    let url = format!("ws://127.0.0.1:{}", port);
+    let (mut ws, _) = connect_async(&url).await.expect("ulanish");
+
+    // ~1s ichida server ping yuborishi kerak. Ping frame klientga ham yetadi
+    // (tokio-tungstenite avtomatik pong qaytaradi, lekin frame'ni ko'rsatadi).
+    let fut = async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Ping(_))) => return,
+                Some(Ok(_)) => continue,
+                Some(Err(e)) => panic!("ws o'qish xatosi: {}", e),
+                None => panic!("ulanish kutilmaganda yopildi"),
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), fut)
+        .await
+        .expect("server davriy ping yubormadi");
 
     let _ = std::fs::remove_file(&path);
 }
