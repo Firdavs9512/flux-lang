@@ -150,7 +150,11 @@ fn match_route(
                     }
                 }
                 Seg::Param(name) => {
-                    params.insert(name.clone(), Value::Str((*seg).to_string()));
+                    // Path segmentlarida ham non-ASCII percent-encode qilinadi
+                    // (masalan `/users/:name` -> `%D0%9A...`) — dekod qilamiz
+                    // (issue #100). Path'da `+` literal, shuning uchun bo'shliqqa
+                    // almashtirilmaydi (faqat query'da form-encoding qoidasi).
+                    params.insert(name.clone(), Value::Str(percent_decode(seg)));
                 }
             }
         }
@@ -261,7 +265,36 @@ fn rate_limited_response(retry_after: u64) -> Value {
     Value::Map(m)
 }
 
-// "a=1&b=2" -> {a:"1" b:"2"}. URL-dekod minimal (faqat '+' -> bo'shliq).
+// Percent-encoded UTF-8 baytlarni (`%D0%9A`) dekod qiladi: `%XX` juftliklarni
+// baytga aylantirib yig'adi, qolgan baytlarni o'zgarmas qoldiradi. Yig'ilgan
+// baytlar UTF-8 deb talqin qilinadi — `from_utf8_lossy` yaroqsiz ketma-ketlikni
+// U+FFFD bilan almashtiradi (panic yo'q). Yaroqsiz `%` (masalan, `%zz` yoki
+// satr oxiridagi `%`) literal `%` sifatida qoladi. Brauzer query va path'dagi
+// non-ASCII (kirill/o'zbekcha) qiymatlarni doim percent-encode qiladi — bu
+// funksiyasiz `req.query.q` xom `%D1%81...` holicha qolardi (issue #100).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+// "a=1&b=2" -> {a:"1" b:"2"}. Kalit va qiymatga `+` -> bo'shliq (form-encoding)
+// va percent-dekod qo'llanadi (issue #100) — kalitlarda ham non-ASCII bo'lishi
+// mumkin, shuning uchun ikkalasi ham dekod qilinadi.
 fn parse_query(q: &str) -> Value {
     let mut m = BTreeMap::new();
     for pair in q.split('&') {
@@ -269,10 +302,12 @@ fn parse_query(q: &str) -> Value {
             continue;
         }
         let (k, v) = match pair.split_once('=') {
-            Some((k, v)) => (k.to_string(), v.replace('+', " ")),
-            None => (pair.to_string(), String::new()),
+            Some((k, v)) => (k, v),
+            None => (pair, ""),
         };
-        m.insert(k, Value::Str(v));
+        let key = percent_decode(&k.replace('+', " "));
+        let val = percent_decode(&v.replace('+', " "));
+        m.insert(key, Value::Str(val));
     }
     Value::Map(m)
 }
@@ -1696,5 +1731,80 @@ mod tests {
             matches!(m.get("ip"), Some(Value::Str(s)) if s == "10.0.0.1"),
             "req.ip o'rnatilishi kerak"
         );
+    }
+
+    // --- query/path percent-dekod (issue #100) ---
+
+    fn query_get(q: &str, key: &str) -> Option<String> {
+        match parse_query(q) {
+            Value::Map(m) => match m.get(key) {
+                Some(Value::Str(s)) => Some(s.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn percent_dekod_utf8_kirill() {
+        // `%D1%81...` -> "салом" (kirill UTF-8 baytlar to'g'ri yig'iladi).
+        assert_eq!(percent_decode("%D1%81%D0%B0%D0%BB%D0%BE%D0%BC"), "салом");
+    }
+
+    #[test]
+    fn percent_dekod_oddiy_belgi() {
+        // `%20` -> bo'shliq, `%2B` -> literal `+` (bo'shliqqa aylanmaydi).
+        assert_eq!(percent_decode("a%20b"), "a b");
+        assert_eq!(percent_decode("a%2Bb"), "a+b");
+    }
+
+    #[test]
+    fn percent_dekod_yaroqsiz_qoldiradi() {
+        // Yaroqsiz `%` ketma-ketligi (`%zz`) va satr oxiridagi `%` literal qoladi
+        // (panic yo'q).
+        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("a%2"), "a%2");
+    }
+
+    #[test]
+    fn query_percent_dekod_qiymat() {
+        // GET /search?q=%D1%81%D0%B0%D0%BB%D0%BE%D0%BC -> q = "салом".
+        assert_eq!(
+            query_get("q=%D1%81%D0%B0%D0%BB%D0%BE%D0%BC", "q").as_deref(),
+            Some("салом")
+        );
+    }
+
+    #[test]
+    fn query_plus_boshliq_va_percent() {
+        // `+` -> bo'shliq (form-encoding), `%20` ham bo'shliq.
+        assert_eq!(
+            query_get("name=John+Doe", "name").as_deref(),
+            Some("John Doe")
+        );
+        assert_eq!(
+            query_get("name=John%20Doe", "name").as_deref(),
+            Some("John Doe")
+        );
+    }
+
+    #[test]
+    fn query_kalit_ham_dekod() {
+        // Kalitda ham non-ASCII bo'lishi mumkin — u ham dekod qilinadi.
+        assert_eq!(query_get("%D0%B0=1", "а").as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn path_param_percent_dekod() {
+        // `/users/:name` -> "/users/%D0%90%D0%BB%D0%B8" param "name" = "Али".
+        let routes = vec![Route {
+            method: "get".into(),
+            pattern: parse_pattern("/users/:name"),
+            handler: Value::Nil,
+        }];
+        let (_r, params) = match_route(&routes, "get", "/users/%D0%90%D0%BB%D0%B8")
+            .expect("marshrut mos kelishi kerak");
+        assert!(matches!(params.get("name"), Some(Value::Str(s)) if s == "Али"));
     }
 }
