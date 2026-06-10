@@ -446,24 +446,33 @@ async fn handle_conn(interp: Arc<Interp>, stream: tokio::net::TcpStream) {
         tokio::select! {
             item = reader.next() => {
                 match item {
-                    Some(Ok(Message::Text(t))) => {
-                        fire_handler(&interp, Event::Message, &id, Some(t.to_string())).await;
+                    Some(Ok(msg)) => {
+                        // Har qanday kelgan kadr ulanish tirikligini isbotlaydi —
+                        // pong shart emas. Uzoq handler `fire_handler().await` da
+                        // bloklab, mijoz pong'ini vaqtida o'qitmasligi mumkin
+                        // (pong xabar orqasida navbatda turadi); shu sabab kutish
+                        // bayrog'ini har kadrda tozalaymiz (review P2).
+                        awaiting_pong = false;
+                        match msg {
+                            Message::Text(t) => {
+                                fire_handler(&interp, Event::Message, &id, Some(t.to_string()))
+                                    .await;
+                            }
+                            Message::Binary(b) => {
+                                // Binary'ni lossy matn sifatida uzatamiz (Flux str-markazli).
+                                let t = String::from_utf8_lossy(&b).to_string();
+                                fire_handler(&interp, Event::Message, &id, Some(t)).await;
+                            }
+                            Message::Close(_) => break,
+                            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
+                        }
                     }
-                    Some(Ok(Message::Binary(b))) => {
-                        // Binary'ni lossy matn sifatida uzatamiz (Flux str-markazli).
-                        let t = String::from_utf8_lossy(&b).to_string();
-                        fire_handler(&interp, Event::Message, &id, Some(t)).await;
-                    }
-                    // Pong keldi — ulanish tirik, kutish bayrog'ini tozalaymiz.
-                    Some(Ok(Message::Pong(_))) => awaiting_pong = false,
-                    Some(Ok(Message::Close(_))) => break,
-                    Some(Ok(Message::Ping(_))) | Some(Ok(Message::Frame(_))) => {}
                     Some(Err(_)) | None => break, // ulanish uzildi
                 }
             }
             _ = ping_interval.tick() => {
                 if awaiting_pong {
-                    break; // oldingi ping'ga pong kelmadi — o'lik ulanish
+                    break; // oldingi ping'ga javob (pong yoki har qanday kadr) kelmadi
                 }
                 awaiting_pong = true;
                 // Kanal to'la/yopiq bo'lsa yozolmaymiz — uzamiz.

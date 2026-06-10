@@ -386,6 +386,49 @@ async fn long_handler_does_not_kill_connection() {
     let _ = std::fs::remove_file(&path);
 }
 
+// review P2 post-ping holati: server ping yuborgach (awaiting_pong=true), mijoz
+// hali ping'ni o'qib pong qaytarmasdan turib sekin xabar yuboradi. Handler
+// `fire_handler().await` da bloklagani uchun pong (xabar orqasida navbatda)
+// o'qilmaydi — eski mantiqда keyingi tick sog'lom ulanishni yopardi. Endi xabar
+// o'zi tiriklik isboti, ulanish saqlanadi.
+#[tokio::test]
+async fn slow_handler_with_outstanding_ping_keeps_connection() {
+    let port = 9317;
+    let script = SLOW_HANDLER_SCRIPT.replace("PORT", &port.to_string());
+    let (child, path) = spawn_server_env(port, &script, &[("FLUX_WS_PING_SECS", "1")]);
+    let _killer = Killer(child);
+    wait_port(port).await;
+
+    let url = format!("ws://127.0.0.1:{}", port);
+    let (mut ws, _) = connect_async(&url).await.expect("ulanish");
+
+    // ~1.3s o'qimaymiz: server 1s'da ping yuboradi (awaiting_pong=true), lekin
+    // mijoz ping'ni o'qimagani uchun pong hali qaytmaydi.
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+
+    // Ping kutilayotgan holatda sekin xabar (handler 2.5s bloklaydi).
+    ws.send(Message::text("slow")).await.unwrap();
+
+    // Handler tugab server qaror qabul qilguncha (~handler oxiri) O'QIMAYMIZ —
+    // aks holda mijoz ping'ni darhol o'qib pong qaytarib bug'ni yashirardi
+    // (deterministik bo'lishi uchun). Eski mantiqда server shu nuqtada
+    // awaiting_pong=true bilan ulanishni yopadi.
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+
+    let first = next_text_within(&mut ws, Duration::from_secs(3)).await;
+    assert_eq!(first, "ok:slow", "sekin handler javobi kutilgan");
+
+    // Ulanish tirik qolishi kerak — pong navbatda turган bo'lsa ham yopilmagan.
+    ws.send(Message::text("again")).await.unwrap();
+    let second = next_text_within(&mut ws, Duration::from_secs(3)).await;
+    assert_eq!(
+        second, "ok:again",
+        "ping kutilayotganda sekin handler ulanishni noto'g'ri yopdi"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
 #[tokio::test]
 async fn disconnect_cleans_room_membership() {
     let port = 9313;
