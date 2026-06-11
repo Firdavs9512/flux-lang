@@ -111,7 +111,9 @@ http.on :get "/notes/:id" \req -> rep 200 {id:req.params.id}
 http.serve 8080
 ```
 - Method: `:get :post :put :patch :del`. `req.body` (JSON→map), `req.params.id`,
-  `req.query`, `req.headers`. Missing key → `nil`.
+  `req.query`, `req.headers`. Missing key → `nil`. Reading repeated headers
+  (req and res): values joined `", "` (`cookie`: `"; "`); repeated `set-cookie`
+  in `res.headers` → list.
 - `rep status body` (map→auto JSON). Redirect: `rep 302 {location:url}`.
 - Custom headers: optional 3rd arg map — `rep 200 "<h1>" {content_type:"text/html"}`.
   Key `_`→`-` (`content_type`→`Content-Type`); name case-insensitive. Repeated
