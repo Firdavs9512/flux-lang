@@ -584,6 +584,36 @@ fn apply_headers_mut(hmap: &mut hyper::HeaderMap, headers: Option<&Value>) {
     }
 }
 
+// HeaderMap -> Flux header map (kalitlar lowercase). O'qish tomonidagi yagona
+// yo'l — server req.headers ham, klient res.headers ham shu orqali quriladi.
+//
+// Bir nomli takror header'lar yo'qolmasligi uchun (issue #101) qiymatlar
+// RFC 9110 §5.3 bo'yicha ", " bilan birlashtiriladi. Ikki istisno:
+//   - `cookie` "; " bilan (RFC 6265 — cookie-pair ajratkichi vergul emas);
+//   - `set-cookie` umuman birlashtirilmaydi (Expires sanasida vergul bor) —
+//     takror bo'lsa List qaytadi, yozish tomonidagi List bilan simmetrik.
+// UTF-8 bo'lmagan baytlar lossy o'qiladi (oldin jim bo'sh string bo'lardi).
+fn headers_to_map(hmap: &hyper::HeaderMap) -> BTreeMap<String, Value> {
+    let mut out = BTreeMap::new();
+    for key in hmap.keys() {
+        let name = key.as_str().to_lowercase();
+        let vals: Vec<String> = hmap
+            .get_all(key)
+            .iter()
+            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+            .collect();
+        let value = if name == "set-cookie" && vals.len() > 1 {
+            Value::List(vals.into_iter().map(Value::Str).collect())
+        } else if name == "cookie" {
+            Value::Str(vals.join("; "))
+        } else {
+            Value::Str(vals.join(", "))
+        };
+        out.insert(name, value);
+    }
+    out
+}
+
 // Javob tanasini tipiga qarab formatlash: map/list -> JSON, str -> matn,
 // nil -> bo'sh, qolgani -> JSON.
 fn body_value_to_response(status: u16, body: Value) -> Response<Full<Bytes>> {
@@ -863,17 +893,16 @@ async fn handle_request(
     let query = uri.query().unwrap_or("").to_string();
 
     // Sarlavhalarni map'ga yig'amiz (kalitlar lowercase, '-' -> '_' shunda
-    // Flux'da req.headers.x_user_id sifatida o'qiladi).
-    let mut headers = BTreeMap::new();
-    let mut is_json = false;
-    for (k, v) in req.headers() {
-        let key = k.as_str().to_lowercase().replace('-', "_");
-        let val = v.to_str().unwrap_or("").to_string();
-        if key == "content_type" && val.contains("application/json") {
-            is_json = true;
-        }
-        headers.insert(key, Value::Str(val));
-    }
+    // Flux'da req.headers.x_user_id sifatida o'qiladi). Takror nomlar
+    // headers_to_map ichida birlashtiriladi (issue #101).
+    let headers: BTreeMap<String, Value> = headers_to_map(req.headers())
+        .into_iter()
+        .map(|(k, v)| (k.replace('-', "_"), v))
+        .collect();
+    let is_json = matches!(
+        headers.get("content_type"),
+        Some(Value::Str(ct)) if ct.contains("application/json")
+    );
 
     // Marshrutni topamiz (handler'ni baytlardan oldin, 404 ni tez qaytarish uchun).
     let matched = {
@@ -1273,13 +1302,9 @@ fn http_client(method: &str, args: Vec<Value>, has_body: bool) -> Result<Value, 
                     .map(|s| s.contains("application/json"))
                     .unwrap_or(false);
 
-                // Header'lar: kalit kichik harf, qiymat str (req.headers bilan simmetrik).
-                let mut headers = BTreeMap::new();
-                for (k, v) in resp.headers() {
-                    if let Ok(val) = v.to_str() {
-                        headers.insert(k.as_str().to_lowercase(), Value::Str(val.to_string()));
-                    }
-                }
+                // Header'lar: kalit kichik harf (defis saqlanadi — m[k] bilan
+                // o'qiladi), takror nomlar birlashtiriladi (issue #101).
+                let headers = headers_to_map(resp.headers());
 
                 let bytes = resp
                     .into_body()
@@ -1388,6 +1413,85 @@ fn is_sensitive_header(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- headers_to_map: o'qish tomonida takror header'lar (issue #101) ---
+
+    // Map'dan str qiymatni oladi (Value Debug/PartialEq emas — pattern bilan).
+    fn hstr(m: &BTreeMap<String, Value>, k: &str) -> String {
+        match m.get(k) {
+            Some(Value::Str(s)) => s.clone(),
+            _ => panic!("{k}: Str qiymat kutilgan edi"),
+        }
+    }
+
+    #[test]
+    fn headers_takror_nom_vergul_bilan_birlashadi() {
+        // Bir nomli ikki header (masalan X-Forwarded-For zanjiri) yo'qolmasin —
+        // RFC 9110 §5.3 bo'yicha ", " bilan bitta qiymatga birlashadi.
+        let mut h = hyper::HeaderMap::new();
+        h.append("x-forwarded-for", "1.1.1.1".parse().unwrap());
+        h.append("x-forwarded-for", "2.2.2.2".parse().unwrap());
+        let m = headers_to_map(&h);
+        assert_eq!(hstr(&m, "x-forwarded-for"), "1.1.1.1, 2.2.2.2");
+    }
+
+    #[test]
+    fn headers_bitta_qiymat_oddiy_str() {
+        let mut h = hyper::HeaderMap::new();
+        h.insert("content-type", "application/json".parse().unwrap());
+        let m = headers_to_map(&h);
+        assert_eq!(hstr(&m, "content-type"), "application/json");
+    }
+
+    #[test]
+    fn headers_cookie_nuqta_vergul_bilan_birlashadi() {
+        // Cookie-pair ajratkichi "; " (RFC 6265) — vergul bilan birlashtirsak
+        // cookie qiymati buziladi.
+        let mut h = hyper::HeaderMap::new();
+        h.append("cookie", "a=1".parse().unwrap());
+        h.append("cookie", "b=2".parse().unwrap());
+        let m = headers_to_map(&h);
+        assert_eq!(hstr(&m, "cookie"), "a=1; b=2");
+    }
+
+    #[test]
+    fn headers_takror_set_cookie_list_qaytadi() {
+        // Set-Cookie birlashtirib bo'lmaydi (Expires sanasida vergul bor) —
+        // takror bo'lsa List, yozish tomonidagi List bilan simmetrik.
+        let mut h = hyper::HeaderMap::new();
+        h.append("set-cookie", "a=1".parse().unwrap());
+        h.append("set-cookie", "b=2".parse().unwrap());
+        let m = headers_to_map(&h);
+        match m.get("set-cookie") {
+            Some(Value::List(items)) => {
+                let got: Vec<String> = items.iter().map(|v| v.to_text()).collect();
+                assert_eq!(got, vec!["a=1", "b=2"]);
+            }
+            _ => panic!("set-cookie: List kutilgan edi"),
+        }
+    }
+
+    #[test]
+    fn headers_bitta_set_cookie_str_qoladi() {
+        // Oddiy holat (bitta cookie) o'zgarmasin — eski kod str kutadi.
+        let mut h = hyper::HeaderMap::new();
+        h.insert("set-cookie", "s=xyz".parse().unwrap());
+        let m = headers_to_map(&h);
+        assert_eq!(hstr(&m, "set-cookie"), "s=xyz");
+    }
+
+    #[test]
+    fn headers_utf8_bolmagan_qiymat_lossy_oqiladi() {
+        // Oldin unwrap_or("") jim bo'sh string qaytarardi — endi lossy: buzuq
+        // bayt U+FFFD bo'ladi, qolgan qism saqlanadi.
+        let mut h = hyper::HeaderMap::new();
+        h.insert(
+            "x-raw",
+            hyper::header::HeaderValue::from_bytes(b"ok\xffend").unwrap(),
+        );
+        let m = headers_to_map(&h);
+        assert_eq!(hstr(&m, "x-raw"), "ok\u{fffd}end");
+    }
 
     #[test]
     fn location_absolute_url() {
