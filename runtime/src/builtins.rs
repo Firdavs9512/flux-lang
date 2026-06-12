@@ -10,11 +10,25 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::interp::{Env, Flow};
 use crate::value::{NativeFn, Value};
 
 type R = Result<Value, Flow>;
+
+// `fluxon test` hisobotidagi "N assert" soni. Atomic — http.serve handler'lari
+// assert'ni parallel thread'larda chaqirishi mumkin. Test runner har fayldan
+// oldin reset qiladi (fayllar ketma-ket, bitta protsessda ishlaydi).
+static ASSERT_PASSED: AtomicU64 = AtomicU64::new(0);
+
+pub fn assert_passed_reset() {
+    ASSERT_PASSED.store(0, Ordering::Relaxed);
+}
+
+pub fn assert_passed() -> u64 {
+    ASSERT_PASSED.load(Ordering::Relaxed)
+}
 
 // --- global funksiyalarni o'rnatish ---
 pub fn install(env: &Env) {
@@ -34,6 +48,27 @@ pub fn install(env: &Env) {
             let parts: Vec<String> = args.iter().map(|v| v.to_text()).collect();
             eprintln!("{}", parts.join(" "));
             Ok(Value::Nil)
+        }),
+    );
+    // assert cond ["xabar"] — test primitivi (issue #136). Shart truthy bo'lsa
+    // jim davom etadi (hisoblagich +1), aks holda runtime xato — bajarish
+    // to'xtaydi va `fluxon test` faylni FAIL deb belgilaydi. Operatorli shart
+    // qavsda yoziladi (qavssiz chaqiruv qoidasi): `assert (x == 2) "x ikki emas"`.
+    add(
+        "assert",
+        Box::new(|args: Vec<Value>| {
+            let cond = match args.first() {
+                Some(v) => v,
+                None => return Err(Flow::err("assert: shart argumenti kerak")),
+            };
+            if cond.truthy() {
+                ASSERT_PASSED.fetch_add(1, Ordering::Relaxed);
+                return Ok(Value::Nil);
+            }
+            Err(Flow::err(match args.get(1) {
+                Some(msg) => format!("assert yiqildi: {}", msg.to_text()),
+                None => "assert yiqildi".to_string(),
+            }))
         }),
     );
     // rep status body [headers] — HTTP javobi. Yangi Value variant qo'shmaslik
