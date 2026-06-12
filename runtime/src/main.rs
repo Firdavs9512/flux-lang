@@ -4,6 +4,8 @@
 //   fluxon run <fayl.fx>     — Fluxon faylini bajaradi
 //   fluxon <fayl.fx>         — xuddi shu (qisqartma)
 //   fluxon check <fayl.fx>   — faqat lex+parse (bajarmaydi); parse xato -> exit 2
+//   fluxon test [yo'l]       — test fayllarini ishga tushiradi (standart: tests/);
+//                              yo'l fayl yoki katalog bo'lishi mumkin
 
 // mimalloc — parallel'da system malloc'dan ancha kam contention beradi.
 // Interpreter qisqa umrli scope allokatsiyalarini ko'p qiladi (tree-walking).
@@ -36,6 +38,8 @@ use std::process::ExitCode;
 enum Command {
     Run(String),
     Check(String),
+    // test: yo'l ixtiyoriy — berilmasa standart `tests/` katalogi ishlatiladi.
+    Test(Option<String>),
 }
 
 fn main() -> ExitCode {
@@ -43,52 +47,178 @@ fn main() -> ExitCode {
     let cmd = match parse_args(&args) {
         Some(c) => c,
         None => {
-            eprintln!("Foydalanish: fluxon run <fayl.fx>  |  fluxon check <fayl.fx>");
+            eprintln!(
+                "Foydalanish: fluxon run <fayl.fx>  |  fluxon check <fayl.fx>  |  fluxon test [yo'l]"
+            );
             return ExitCode::from(2);
-        }
-    };
-
-    let path = match &cmd {
-        Command::Run(p) | Command::Check(p) => p.clone(),
-    };
-
-    let src = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Faylni o'qib bo'lmadi '{}': {}", path, e);
-            return ExitCode::from(1);
         }
     };
 
     match cmd {
         // run: LEX -> PARSE -> BAJAR. Xato (parse yoki runtime) -> exit 1.
-        Command::Run(_) => match run_source_at(&src, std::path::Path::new(&path)) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("Fluxon xato: {}", e);
-                ExitCode::from(1)
+        Command::Run(path) => {
+            let src = match read_source(&path) {
+                Ok(s) => s,
+                Err(code) => return code,
+            };
+            match run_source_at(&src, std::path::Path::new(&path)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("Fluxon xato: {}", e);
+                    ExitCode::from(1)
+                }
             }
-        },
+        }
         // check: faqat LEX + PARSE (interp YO'Q -> side-effect yo'q). Forge
         // eval-gate QATLAM 1: AI yozgan blok sintaktik to'g'rimi, bajarmasdan.
         // Parse/lex xato -> exit 2 (runtime exit 1 dan farqli).
-        Command::Check(_) => match check_source(&src) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("Fluxon xato: {}", e);
-                ExitCode::from(2)
+        Command::Check(path) => {
+            let src = match read_source(&path) {
+                Ok(s) => s,
+                Err(code) => return code,
+            };
+            match check_source(&src) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("Fluxon xato: {}", e);
+                    ExitCode::from(2)
+                }
             }
-        },
+        }
+        // test: bitta fayl o'qimaydi — o'zi fayllarni topib ishga tushiradi.
+        Command::Test(path) => run_tests(path.as_deref()),
     }
+}
+
+// Faylni o'qiydi; xatoda xabarni chiqarib, chiqish kodini (1) qaytaradi.
+fn read_source(path: &str) -> Result<String, ExitCode> {
+    std::fs::read_to_string(path).map_err(|e| {
+        eprintln!("Faylni o'qib bo'lmadi '{}': {}", path, e);
+        ExitCode::from(1)
+    })
 }
 
 fn parse_args(args: &[String]) -> Option<Command> {
     match args.get(1).map(|s| s.as_str()) {
         Some("run") => args.get(2).cloned().map(Command::Run),
         Some("check") => args.get(2).cloned().map(Command::Check),
+        Some("test") => Some(Command::Test(args.get(2).cloned())),
         Some(p) if !p.starts_with('-') => Some(Command::Run(p.to_string())),
         _ => None,
     }
+}
+
+// `fluxon test [yo'l]` — issue #136. Yo'l berilmasa joriy katalogdagi `tests/`
+// ishlatiladi; fayl berilsa faqat o'sha fayl, katalog berilsa ichidagi barcha
+// .fx fayllar (rekursiv, nom bo'yicha tartibda). Har fayl alohida interp bilan
+// bajariladi: xatosiz tugasa PASS, xato (assert yiqilishi ham) bo'lsa FAIL —
+// keyingi fayllar baribir ishlaydi. Exit: hammasi o'tsa 0, FAIL bor -> 1,
+// yo'l/fayl topilmasa 2 (run/check exit konvensiyasiga mos).
+fn run_tests(path: Option<&str>) -> ExitCode {
+    let target = std::path::Path::new(path.unwrap_or("tests"));
+    let files = match collect_test_files(target) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("{}", e);
+            return ExitCode::from(2);
+        }
+    };
+
+    let (passed, failed) = run_test_files(&files);
+    println!(
+        "YAKUN: {} PASS, {} FAIL ({} fayl)",
+        passed,
+        failed,
+        files.len()
+    );
+    if failed == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+// Test fayllar ro'yxatini tuzadi. Fayl -> o'zi; katalog -> ichidagi .fx'lar.
+// Bo'sh ro'yxat ham xato: "test o'tdi" deb jim chiqish chalg'ituvchi bo'lardi.
+fn collect_test_files(target: &std::path::Path) -> Result<Vec<std::path::PathBuf>, String> {
+    let files = if target.is_file() {
+        // .fx bo'lmagan fayl (codex P2): Fluxon sifatida parse qilib FAIL/exit 1
+        // berish chalg'ituvchi — bu discovery xatosi (exit 2), test natijasi emas.
+        if target.extension().is_none_or(|e| e != "fx") {
+            return Err(format!("'{}' .fx fayl emas", target.display()));
+        }
+        vec![target.to_path_buf()]
+    } else if target.is_dir() {
+        let mut v = Vec::new();
+        collect_fx_files(target, &mut v)?;
+        v.sort();
+        v
+    } else {
+        return Err(format!("Test yo'li topilmadi: '{}'", target.display()));
+    };
+    if files.is_empty() {
+        return Err(format!(
+            "'{}' ichida .fx test fayli topilmadi",
+            target.display()
+        ));
+    }
+    Ok(files)
+}
+
+// IO xatolari yutilmaydi (codex P2): o'qib bo'lmaydigan ichki katalog jim
+// o'tkazilsa, "hammasi o'tdi" hisoboti aslida topilmagan testlarni yashirardi.
+fn collect_fx_files(
+    dir: &std::path::Path,
+    out: &mut Vec<std::path::PathBuf>,
+) -> Result<(), String> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| format!("'{}' katalogini o'qib bo'lmadi: {}", dir.display(), e))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| format!("'{}' ichini o'qib bo'lmadi: {}", dir.display(), e))?;
+        let p = entry.path();
+        // file_type() symlink'ni KUZATMAYDI — halqali symlink (tests/x -> tests/)
+        // cheksiz rekursiyaga olib bormasin. Symlink'langan .fx fayl baribir
+        // kiradi (pastdagi is_file symlink'ni kuzatadi), symlink-katalog esa yo'q.
+        let ft = entry
+            .file_type()
+            .map_err(|e| format!("'{}' turini aniqlab bo'lmadi: {}", p.display(), e))?;
+        if ft.is_dir() {
+            collect_fx_files(&p, out)?;
+        } else if p.extension().is_some_and(|e| e == "fx") && p.is_file() {
+            out.push(p);
+        }
+    }
+    Ok(())
+}
+
+// Fayllarni ketma-ket bajaradi, (PASS, FAIL) sonini qaytaradi. Assert
+// hisoblagichi har fayldan oldin reset qilinadi — "N assert" fayl o'zinikini
+// ko'rsatadi (fayllar bitta protsessda ketma-ket ishlaydi).
+fn run_test_files(files: &[std::path::PathBuf]) -> (usize, usize) {
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    for f in files {
+        builtins::assert_passed_reset();
+        let result = std::fs::read_to_string(f)
+            .map_err(|e| format!("faylni o'qib bo'lmadi: {}", e))
+            .and_then(|src| run_source_at(&src, f));
+        match result {
+            Ok(()) => {
+                println!(
+                    "PASS {} ({} assert)",
+                    f.display(),
+                    builtins::assert_passed()
+                );
+                passed += 1;
+            }
+            Err(e) => {
+                println!("FAIL {} — {}", f.display(), e);
+                failed += 1;
+            }
+        }
+    }
+    (passed, failed)
 }
 
 // Sintaksisni tekshiradi: lex + parse, lekin interp'ni o't kazib yuboradi —
@@ -2622,6 +2752,125 @@ log "${fib 10}"
             Some(Command::Check(p)) => assert_eq!(p, "test.fx"),
             _ => panic!("Command::Check kutilgan edi, topildi boshqa variant"),
         }
+    }
+
+    // parse_args: `test` yo'lsiz (standart tests/) va yo'l bilan ishlaydi.
+    #[test]
+    fn parse_args_test_buyrugi() {
+        let to_args = |a: &[&str]| -> Vec<String> { a.iter().map(|s| s.to_string()).collect() };
+        match parse_args(&to_args(&["fluxon", "test"])) {
+            Some(Command::Test(None)) => {}
+            _ => panic!("Command::Test(None) kutilgan edi"),
+        }
+        match parse_args(&to_args(&["fluxon", "test", "smoke.fx"])) {
+            Some(Command::Test(Some(p))) => assert_eq!(p, "smoke.fx"),
+            _ => panic!("Command::Test(Some) kutilgan edi"),
+        }
+    }
+
+    // issue #136: assert primitivi — truthy shart jim o'tadi, falsy shart
+    // xabar bilan runtime xato beradi (fayl FAIL bo'ladi).
+    #[test]
+    fn assert_primitivi() {
+        run(r#"
+assert true
+assert (1 + 1 == 2) "matematika ishlaydi"
+assert "bo'sh bo'lmagan str ham truthy"
+"#);
+        let err = run_source(r#"assert (1 == 2) "bir ikki emas""#).unwrap_err();
+        assert!(
+            err.contains("assert yiqildi: bir ikki emas"),
+            "xabar kutilgandek emas: {}",
+            err
+        );
+        // xabarsiz variant ham yiqiladi
+        let err = run_source("assert false").unwrap_err();
+        assert!(err.contains("assert yiqildi"), "xabar: {}", err);
+        // nil ham falsy
+        assert!(run_source("assert nil").is_err());
+    }
+
+    // issue #136: `fluxon test` fayl topish — katalogdan .fx'lar rekursiv,
+    // tartiblangan; bitta fayl o'z holicha; yo'q yo'l/bo'sh katalog -> xato.
+    #[test]
+    fn test_fayllarini_topish() {
+        let dir = std::env::temp_dir().join(format!("fluxon_test_disc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir); // oldingi muvaffaqiyatsiz run qoldig'i
+        let sub = dir.join("ichki");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(dir.join("b.fx"), "assert true").unwrap();
+        std::fs::write(dir.join("a.fx"), "assert true").unwrap();
+        std::fs::write(dir.join("eslatma.txt"), "fx emas").unwrap();
+        std::fs::write(sub.join("c.fx"), "assert true").unwrap();
+
+        let files = collect_test_files(&dir).unwrap();
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.strip_prefix(&dir).unwrap().display().to_string())
+            .collect();
+        assert_eq!(names, ["a.fx", "b.fx", "ichki/c.fx"]);
+
+        // bitta fayl — ro'yxat faqat o'sha fayldan iborat
+        let one = collect_test_files(&dir.join("a.fx")).unwrap();
+        assert_eq!(one.len(), 1);
+
+        // .fx bo'lmagan aniq fayl — discovery xatosi (Fluxon sifatida bajarilmaydi)
+        let err = collect_test_files(&dir.join("eslatma.txt")).unwrap_err();
+        assert!(err.contains(".fx fayl emas"), "xabar: {}", err);
+
+        // mavjud bo'lmagan yo'l — xato
+        assert!(collect_test_files(&dir.join("yoq")).is_err());
+
+        // .fx'siz katalog — xato (jim "0 fayl o'tdi" chalg'ituvchi bo'lardi)
+        let empty = dir.join("bosh");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(collect_test_files(&empty).is_err());
+
+        // halqali symlink (katalog o'ziga ishora) cheksiz rekursiya bermasin —
+        // file_type() symlink'ni kuzatmaydi, halqa shunchaki o'tkazib yuboriladi.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&dir, dir.join("halqa")).unwrap();
+            let with_loop = collect_test_files(&dir).unwrap();
+            assert_eq!(with_loop.len(), 3, "halqa fayl ro'yxatini o'zgartirmasin");
+        }
+
+        // o'qib bo'lmaydigan ichki katalog jim o'tkazilmasin — xato ko'tarilsin
+        // (codex P2). root ruxsat cheklovini chetlab o'tadi, shuning uchun faqat
+        // cheklov haqiqatan ishlagan muhitda tekshiramiz (CI runner non-root).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let yopiq = dir.join("yopiq");
+            std::fs::create_dir_all(&yopiq).unwrap();
+            std::fs::write(yopiq.join("d.fx"), "assert true").unwrap();
+            std::fs::set_permissions(&yopiq, std::fs::Permissions::from_mode(0o000)).unwrap();
+            if std::fs::read_dir(&yopiq).is_err() {
+                let err = collect_test_files(&dir).unwrap_err();
+                assert!(err.contains("o'qib bo'lmadi"), "xabar: {}", err);
+            }
+            // cleanup uchun ruxsatni qaytaramiz
+            std::fs::set_permissions(&yopiq, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // issue #136: yiqilgan fayl keyingilarni to'xtatmaydi — har fayl alohida
+    // hisoblanadi va yakunda (PASS, FAIL) soni to'g'ri chiqadi.
+    #[test]
+    fn test_runner_fail_keyingisini_toxtatmaydi() {
+        let dir = std::env::temp_dir().join(format!("fluxon_test_run_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir); // oldingi muvaffaqiyatsiz run qoldig'i
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("01_yiqiladi.fx"), r#"assert false "ataylab""#).unwrap();
+        std::fs::write(dir.join("02_otadi.fx"), "assert (2 > 1)").unwrap();
+
+        let files = collect_test_files(&dir).unwrap();
+        let (passed, failed) = run_test_files(&files);
+        assert_eq!((passed, failed), (1, 1));
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     // issue #57: symbol MATNGA aylanganda `:` prefiks tashlanadi
