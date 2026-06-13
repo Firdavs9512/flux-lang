@@ -223,7 +223,7 @@ async fn http_post_json(port: u16, path: &str, body: &str) -> String {
     );
     stream.write_all(req.as_bytes()).await.expect("http yozish");
     let mut resp = Vec::new();
-    stream.read_to_end(&mut resp).await.expect("http o'qish");
+    stream.read_to_end(&mut resp).await.expect("http read");
     String::from_utf8_lossy(&resp).to_string()
 }
 

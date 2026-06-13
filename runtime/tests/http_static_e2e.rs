@@ -33,7 +33,7 @@ fn make_static_dir(tag: &str) -> std::path::PathBuf {
 fn spawn_server(port: u16, script: &str) -> (Child, std::path::PathBuf) {
     let path = std::env::temp_dir().join(format!("fluxon_static_test_{}.fx", port));
     let mut f = std::fs::File::create(&path).expect("temp fx yaratish");
-    f.write_all(script.as_bytes()).expect("temp fx yozish");
+    f.write_all(script.as_bytes()).expect("write temp fx");
     drop(f);
 
     let bin = env!("CARGO_BIN_EXE_fluxon");
@@ -89,7 +89,7 @@ async fn http_get_with_header(port: u16, path: &str, header: Option<&str>) -> St
     );
     stream.write_all(req.as_bytes()).await.expect("http yozish");
     let mut resp = Vec::new();
-    stream.read_to_end(&mut resp).await.expect("http o'qish");
+    stream.read_to_end(&mut resp).await.expect("http read");
     String::from_utf8_lossy(&resp).to_string()
 }
 
@@ -248,7 +248,7 @@ async fn static_spa_fallback() {
     let req = "POST /app.css HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     stream.write_all(req.as_bytes()).await.expect("yozish");
     let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await.expect("o'qish");
+    stream.read_to_end(&mut buf).await.expect("read");
     let resp = String::from_utf8_lossy(&buf).to_string();
     assert!(
         resp.contains("404"),
@@ -260,13 +260,13 @@ async fn static_spa_fallback() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-// Middleware also protects a static path: auth required under /himoya/*.
+// Middleware also protects a static path: auth required under /protected/*.
 const MW_SCRIPT: &str = r#"
-http.before "/himoya/*" \req ->
+http.before "/protected/*" \req ->
   if !req.headers.x_token
     fail 401 "auth required"
 
-http.static "/himoya" "DIR/public"
+http.static "/protected" "DIR/public"
 
 http.serve PORT
 "#;
@@ -283,7 +283,7 @@ async fn static_middleware_himoya_qiladi() {
     wait_port(port).await;
 
     // Without a token -- middleware fail 401, file content is not exposed.
-    let resp = http_get(port, "/himoya/app.css").await;
+    let resp = http_get(port, "/protected/app.css").await;
     assert!(resp.contains("401"), "expected 401: {}", resp);
     assert!(
         !resp.contains("body{color:red}"),
@@ -293,7 +293,7 @@ async fn static_middleware_himoya_qiladi() {
 
     // Without a token a MISSING file is also 401 -- not 404 (codex P2): otherwise
     // the status difference (401=exists, 404=missing) would leak protected file names.
-    let resp = http_get(port, "/himoya/yoq-fayl.css").await;
+    let resp = http_get(port, "/protected/missing-file.css").await;
     assert!(
         resp.contains("401"),
         "a missing file should also be 401 without auth (no name leak): {}",
@@ -301,13 +301,18 @@ async fn static_middleware_himoya_qiladi() {
     );
 
     // With a token -- the file comes back.
-    let resp = http_get_with_header(port, "/himoya/app.css", Some("X-Token: sir")).await;
+    let resp = http_get_with_header(port, "/protected/app.css", Some("X-Token: secret")).await;
     assert!(resp.contains("200"), "with token expected 200: {}", resp);
     assert!(resp.contains("body{color:red}"), "expected css: {}", resp);
 
     // With a token, a missing file -- now a real 404.
-    let resp = http_get_with_header(port, "/himoya/yoq-fayl.css", Some("X-Token: sir")).await;
-    assert!(resp.contains("404"), "token bilan yo'q fayl 404: {}", resp);
+    let resp =
+        http_get_with_header(port, "/protected/missing-file.css", Some("X-Token: secret")).await;
+    assert!(
+        resp.contains("404"),
+        "a missing file with a token must 404: {}",
+        resp
+    );
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&root);
@@ -318,12 +323,9 @@ async fn static_yoq_katalog_xato_beradi() {
     // A nonexistent directory -- the server exits with an error right at start
     // (fail fast), not a silent 404.
     let port = 8446;
-    let script = format!(
-        "http.static \"/x\" \"/yoq/katalog/aslo\"\nhttp.serve {}\n",
-        port
-    );
+    let script = format!("http.static \"/x\" \"/no/such/dir\"\nhttp.serve {}\n", port);
     let path = std::env::temp_dir().join(format!("fluxon_static_test_{}.fx", port));
-    std::fs::write(&path, &script).expect("temp fx yozish");
+    std::fs::write(&path, &script).expect("write temp fx");
 
     let bin = env!("CARGO_BIN_EXE_fluxon");
     let out = Command::new(bin)
@@ -365,7 +367,7 @@ async fn static_head_faylni_oqimasdan_javob_beradi() {
     let req = "HEAD /assets/app.css HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
     stream.write_all(req.as_bytes()).await.expect("yozish");
     let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await.expect("o'qish");
+    stream.read_to_end(&mut buf).await.expect("read");
     let resp = String::from_utf8_lossy(&buf).to_string();
     let low = resp.to_lowercase();
 

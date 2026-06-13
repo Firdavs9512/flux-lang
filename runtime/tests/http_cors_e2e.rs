@@ -86,7 +86,7 @@ async fn http_request_full(
     );
     stream.write_all(req.as_bytes()).await.expect("http yozish");
     let mut resp = Vec::new();
-    stream.read_to_end(&mut resp).await.expect("http o'qish");
+    stream.read_to_end(&mut resp).await.expect("http read");
     String::from_utf8_lossy(&resp).to_string()
 }
 
@@ -201,7 +201,7 @@ async fn cors_404_ham_header_oladi() {
 
     // A nonexistent path -- 404, but CORS headers must be present (so the browser
     // can read the error body).
-    let resp = http_request(port, "GET", "/yoq", Some("https://app.example.com")).await;
+    let resp = http_request(port, "GET", "/missing", Some("https://app.example.com")).await;
     assert!(resp.contains("404"), "expected 404: {}", resp);
     assert!(
         resp.to_lowercase()
@@ -298,7 +298,7 @@ async fn cors_413_xato_javob_ham_header_oladi() {
                Content-Type: application/json\r\nContent-Length: 9999\r\nConnection: close\r\n\r\n";
     stream.write_all(req.as_bytes()).await.expect("yozish");
     let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await.expect("o'qish");
+    stream.read_to_end(&mut buf).await.expect("read");
     let resp = String::from_utf8_lossy(&buf).to_string();
 
     assert!(resp.contains("413"), "expected 413: {}", resp);

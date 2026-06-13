@@ -1200,17 +1200,17 @@ impl Interp {
         self.tx_outer(lambda)
     }
 
-    // Birinchi (tashqi) tx: BEGIN ... COMMIT/ROLLBACK.
+    // First (outer) tx: BEGIN ... COMMIT/ROLLBACK.
     fn tx_outer(self: &Arc<Self>, lambda: Value) -> Result<Value, Flow> {
         let tx = self.db()?.begin().map_err(Flow::err)?;
         CURRENT_TX.with(|c| *c.borrow_mut() = Some(tx));
-        // Lambda panic qilsa ham thread_local tozalanadi (normal yo'lda quyidagi
-        // take() dan keyin guard no-op bo'ladi).
+        // thread_local is cleared even if the lambda panics (on the normal path
+        // the guard is a no-op after the take() below).
         let _guard = TxClearGuard;
 
         let result = self.apply(lambda, vec![]);
 
-        // tx'ni thread_local'dan qaytarib olamiz (commit/rollback uni egallaydi).
+        // We take the tx back from thread_local (commit/rollback takes ownership of it).
         let tx = CURRENT_TX.with(|c| c.borrow_mut().take());
         let tx = match tx {
             Some(tx) => tx,
@@ -1228,7 +1228,7 @@ impl Interp {
             },
             Err(flow) => {
                 let _ = tx.rollback();
-                // skip/stop -> aniqroq xato
+                // skip/stop -> clearer error
                 match flow {
                     Flow::Skip | Flow::Stop => Err(Flow::err("skip/stop used inside db.tx")),
                     other => Err(other),
@@ -1237,7 +1237,7 @@ impl Interp {
         }
     }
 
-    // Nested tx: joriy tx ustida SAVEPOINT.
+    // Nested tx: SAVEPOINT on top of the current tx.
     fn tx_nested(self: &Arc<Self>, lambda: Value) -> Result<Value, Flow> {
         let depth = TX_DEPTH.with(|d| {
             let n = d.get() + 1;
@@ -1285,15 +1285,15 @@ impl Interp {
         }
     }
 
-    // build_* trait metodini global db ustida chaqiradi (SQL generatsiya
-    // backend'ga bog'liq, lekin db.* ichida tx bo'lsa ham bir xil dialekt).
+    // Calls the build_* trait method on the global db (SQL generation is
+    // backend-dependent, but the dialect is the same even when there is a tx in db.*).
     fn db_builder(&self, f: impl FnOnce(&dyn Db) -> String) -> Result<String, Flow> {
         let db = self.db()?;
         Ok(f(db.as_ref()))
     }
 
-    // Builder terminal: db.all/first/agg/agg_row. Builder map'dan SQL yasab
-    // bajaradi va natijani rejimga qarab qaytaradi.
+    // Builder terminal: db.all/first/agg/agg_row. Builds SQL from the builder map,
+    // executes it, and returns the result according to the mode.
     fn db_run_query(self: &Arc<Self>, args: Vec<Value>, mode: RunMode) -> Result<Value, Flow> {
         let who = match mode {
             RunMode::All => "db.all",
@@ -1307,10 +1307,10 @@ impl Interp {
             _ => return Err(Flow::err(format!("{}: no table in builder", who))),
         };
 
-        // Bog'lash qiymatlari ($1, $2, ...) — SQL'dagi joylashish tartibida.
-        // Agg holatida SELECT ichidagi shartli filtr bind'lari WHERE'dan OLDIN
-        // keladi, shuning uchun build_agg_select'ni build_where'dan OLDIN
-        // chaqiramiz (aks holda $N raqamlari siljib ketadi).
+        // Bind values ($1, $2, ...) — in the order they appear in the SQL.
+        // In the agg case the conditional-filter binds inside SELECT come BEFORE
+        // the WHERE, so we call build_agg_select BEFORE build_where (otherwise the
+        // $N numbers would shift).
         let mut binds: Vec<SqlVal> = Vec::new();
         let is_agg = matches!(mode, RunMode::Agg | RunMode::AggRow);
         let select_sql = if is_agg {
@@ -1319,7 +1319,7 @@ impl Interp {
             format!("SELECT * FROM {}", q_ident(&table))
         };
 
-        // WHERE bo'laklari (bind'lar SELECT'dan keyin davom etadi).
+        // WHERE clauses (binds continue after the SELECT ones).
         let mut where_parts: Vec<String> = Vec::new();
         self.build_where(&table, &b, &mut where_parts, &mut binds)?;
 
@@ -1328,7 +1328,7 @@ impl Interp {
             sql.push_str(" WHERE ");
             sql.push_str(&where_parts.join(" AND "));
         }
-        // GROUP BY (faqat agg + group bo'lsa).
+        // GROUP BY (only when agg + group).
         if is_agg && let Some(Value::List(cols)) = b.get("group") {
             let gb = cols
                 .iter()
@@ -1357,8 +1357,8 @@ impl Interp {
             };
             sql.push_str(&format!(" ORDER BY {}{}", q_ident(col), dir));
         }
-        // LIMIT / OFFSET (agg_row/first uchun limit 1 majburiy emas — natijani
-        // kod tomonda olamiz, lekin first uchun LIMIT 1 qo'shamiz).
+        // LIMIT / OFFSET (limit 1 is not required for agg_row/first — we take the
+        // result on the code side, but for first we add LIMIT 1).
         if matches!(mode, RunMode::First) {
             sql.push_str(" LIMIT 1");
         } else {
@@ -1375,9 +1375,9 @@ impl Interp {
             match (limit, offset) {
                 (Some(n), Some(off)) => sql.push_str(&format!(" LIMIT {} OFFSET {}", n, off)),
                 (Some(n), None) => sql.push_str(&format!(" LIMIT {}", n)),
-                // OFFSET LIMIT'siz: SQLite OFFSET uchun LIMIT talab qiladi, shu
-                // sabab avval jim e'tiborsiz qolardi. LIMIT -1 = cheksiz qatordan
-                // off tasini o'tkazib yuboradi.
+                // OFFSET without LIMIT: SQLite requires a LIMIT for OFFSET, which
+                // is why it used to be silently ignored. LIMIT -1 = skips off rows
+                // out of an unlimited number of rows.
                 (None, Some(off)) => sql.push_str(&format!(" LIMIT -1 OFFSET {}", off)),
                 (None, None) => {}
             }
@@ -1402,7 +1402,7 @@ impl Interp {
         }
     }
 
-    // Builder'ning eq/cmp filtrlaridan WHERE bo'laklari va bog'lashlarni yasaydi.
+    // Builds WHERE clauses and bindings from the builder's eq/cmp filters.
     fn build_where(
         &self,
         table: &str,
@@ -1410,12 +1410,12 @@ impl Interp {
         parts: &mut Vec<String>,
         binds: &mut Vec<SqlVal>,
     ) -> Result<(), Flow> {
-        // eq: {col:val} — tenglik; list qiymat → IN (...).
+        // eq: {col:val} — equality; list value → IN (...).
         if let Some(Value::Map(eq)) = b.get("eq") {
             for (col, v) in eq {
                 match v {
                     Value::List(items) => {
-                        // IN (...) — bo'sh list = doim yolg'on (1=0).
+                        // IN (...) — empty list = always false (1=0).
                         if items.is_empty() {
                             parts.push("1=0".to_string());
                             continue;
@@ -1427,7 +1427,7 @@ impl Interp {
                         }
                         parts.push(format!("{} IN ({})", q_ident(col), places.join(",")));
                     }
-                    // nil → IS NULL (SQL'da `= NULL` hech qachon mos kelmaydi).
+                    // nil → IS NULL (`= NULL` never matches in SQL).
                     Value::Nil => {
                         parts.push(format!("{} IS NULL", q_ident(col)));
                     }
@@ -1438,7 +1438,7 @@ impl Interp {
                 }
             }
         }
-        // cmp: [col, op, val] uchliklari.
+        // cmp: [col, op, val] triples.
         if let Some(Value::List(cmps)) = b.get("cmp") {
             for c in cmps {
                 if let Value::List(triple) = c
@@ -1454,9 +1454,9 @@ impl Interp {
         Ok(())
     }
 
-    // Aggregatsiya SELECT ro'yxatini yasaydi: group ustunlari + agg ifodalari.
-    // Shartli agg (count_if/sum_if) SUM(CASE WHEN <filter> THEN ... END) bo'ladi —
-    // filter bog'lashlari binds'ga SELECT ichida (WHERE'dan OLDIN) qo'shiladi.
+    // Builds the aggregation SELECT list: group columns + agg expressions.
+    // A conditional agg (count_if/sum_if) becomes SUM(CASE WHEN <filter> THEN ... END) —
+    // the filter bindings are added to binds inside SELECT (BEFORE the WHERE).
     fn build_agg_select(
         &self,
         table: &str,
@@ -1464,7 +1464,7 @@ impl Interp {
         binds: &mut Vec<SqlVal>,
     ) -> Result<String, Flow> {
         let mut cols: Vec<String> = Vec::new();
-        // group ustunlari natijaga ham chiqadi.
+        // group columns also appear in the result.
         if let Some(Value::List(g)) = b.get("group") {
             for v in g {
                 if let Value::Str(s) = v {
@@ -1486,23 +1486,23 @@ impl Interp {
             let col = str_at(spec, 1);
             let out = str_at(spec, 2);
             let filt = spec.get(3);
-            // Agregat ichidagi ifoda: count → *, boshqalar → ustun.
+            // Expression inside the aggregate: count → *, others → column.
             let inner = if kind == "count" {
                 "*".to_string()
             } else {
                 q_ident(&col)
             };
             let expr = match filt {
-                // Shartsiz: COUNT(*) / SUM(col).
+                // Unconditional: COUNT(*) / SUM(col).
                 Some(Value::Nil) | None => format!("{}({})", kind.to_uppercase(), inner),
-                // Shartli: filter'ni CASE WHEN'ga aylantirib agregatga o'raymiz.
+                // Conditional: convert the filter to CASE WHEN and wrap it in the aggregate.
                 Some(Value::Map(f)) => {
                     let cond = self.filter_to_case_cond(table, f, binds)?;
                     if kind == "count" {
                         // COUNT(*) FILTER ekvivalenti: SUM(CASE WHEN cond THEN 1 ELSE 0 END).
-                        // COALESCE — bo'sh natijada SUM NULL beradi, lekin count_if
-                        // COUNT semantikasidek 0 qaytarishi kerak (bo'sh tenant
-                        // dashboard'i nil emas 0 ko'rsatsin).
+                        // COALESCE — on an empty result SUM returns NULL, but count_if
+                        // must return 0 like COUNT semantics (an empty tenant's
+                        // dashboard should show 0, not nil).
                         format!("COALESCE(SUM(CASE WHEN {} THEN 1 ELSE 0 END), 0)", cond)
                     } else {
                         format!(
@@ -1524,9 +1524,9 @@ impl Interp {
         ))
     }
 
-    // Shartli agregat filtrini SQL CASE-shartiga aylantiradi (col = $N AND ...),
-    // list qiymat → IN. Bog'lashlar binds'ga qo'shiladi (tartib muhim — bu
-    // SELECT ichida, WHERE'dan oldin chaqiriladi).
+    // Converts a conditional-aggregate filter into an SQL CASE condition (col = $N AND ...),
+    // list value → IN. Bindings are added to binds (order matters — this is
+    // inside SELECT, called before the WHERE).
     fn filter_to_case_cond(
         &self,
         table: &str,
@@ -1566,7 +1566,7 @@ impl Interp {
     }
 }
 
-// agg spec list'idan i-pozitsiyadagi string (yoki bo'sh).
+// The string at position i from the agg spec list (or empty).
 fn str_at(spec: &[Value], i: usize) -> String {
     match spec.get(i) {
         Some(Value::Str(s)) => s.clone(),
@@ -1574,11 +1574,11 @@ fn str_at(spec: &[Value], i: usize) -> String {
     }
 }
 
-// --- Value <-> SqlVal va schema-aware konversiya ---
+// --- Value <-> SqlVal and schema-aware conversion ---
 
 impl Interp {
-    // Fluxon map'ni (ustun, qiymat) ro'yxatlariga ajratadi. BTreeMap tartibi
-    // deterministik — bog'lash bilan mos keladi.
+    // Splits a Fluxon map into (column, value) lists. The BTreeMap order is
+    // deterministic — it matches the bindings.
     fn map_to_cols(
         &self,
         table: &str,
@@ -1593,7 +1593,7 @@ impl Interp {
         Ok((cols, vals))
     }
 
-    // Berilgan ustunlar tartibida map'dan qiymatlarni oladi (upsert uchun).
+    // Takes values from the map in the given column order (for upsert).
     fn cols_to_vals(
         &self,
         table: &str,
@@ -1608,7 +1608,7 @@ impl Interp {
         Ok(vals)
     }
 
-    // Fluxon Value -> SqlVal (yozishda). json ustunga map/list -> json_encode.
+    // Fluxon Value -> SqlVal (when writing). map/list into a json column -> json_encode.
     fn value_to_sqlval(&self, table: &str, col: &str, v: &Value) -> Result<SqlVal, Flow> {
         Ok(match v {
             Value::Int(n) => SqlVal::Int(*n),
@@ -1617,13 +1617,13 @@ impl Interp {
             Value::Bool(b) => SqlVal::Int(if *b { 1 } else { 0 }),
             Value::Nil => SqlVal::Null,
             Value::Sym(s) => SqlVal::Text(s.clone()),
-            // bytes -> BLOB (issue #132): SQLite tabiiy ikkilik ustun.
+            // bytes -> BLOB (issue #132): SQLite native binary column.
             Value::Bytes(b) => SqlVal::Blob(b.as_ref().clone()),
             Value::List(_) | Value::Map(_) => {
-                // Yozishda faqat process-ichi tbl registry tekshiriladi.
-                // DB introspeksiyasi o'qish tomoni uchun (json dekod) — shu
-                // yerda ishlatilsa TEXT ustunlarga eski schema-less yozish
-                // buziladi (tbl yo'q process TEXT ustuniga yozolmay qoladi).
+                // When writing, only the in-process tbl registry is checked.
+                // DB introspection is for the read side (json decode) — if used
+                // here, the old schema-less writing to TEXT columns would break
+                // (a process without tbl would be unable to write to a TEXT column).
                 let tbl_type = self
                     .schema
                     .read()
@@ -1641,8 +1641,8 @@ impl Interp {
                     )));
                 }
             }
-            // ctx (req.ctx) — odatda get_field snapshot Map beradi, lekin ehtiyot
-            // uchun: oddiy map kabi json ustunga yoziladi (snapshot).
+            // ctx (req.ctx) — usually get_field returns a snapshot Map, but just in
+            // case: written to a json column like an ordinary map (snapshot).
             Value::Ctx(c) => {
                 let snap = Value::Map(c.lock().unwrap().clone());
                 return self.value_to_sqlval(table, col, &snap);
@@ -1653,7 +1653,7 @@ impl Interp {
         })
     }
 
-    // Qatorni Fluxon map'ga aylantiradi, schema bo'yicha sym/json/bool tiklanadi.
+    // Converts a row to a Fluxon map; sym/json/bool are reconstructed per the schema.
     fn row_to_value(&self, table: Option<&str>, row: Row) -> Value {
         let mut m = BTreeMap::new();
         for (col, cell) in row {
@@ -1663,10 +1663,11 @@ impl Interp {
         Value::Map(m)
     }
 
-    // Ustun tipini oladi. Birlamchi manba — joriy process'da `tbl` bilan e'lon
-    // qilingan schema registry. U bo'lmasa (masalan ikki-process setup'da
-    // o'qigich tbl e'lon qilmaydi) DB sxemasidan introspeksiya bilan tiklaymiz —
-    // shunda json ustun process chegarasidan qat'i nazar bir xil map qaytaradi.
+    // Gets the column type. The primary source is the schema registry declared
+    // with `tbl` in the current process. If that is absent (for example in a
+    // two-process setup the reader does not declare tbl) we reconstruct it via
+    // introspection from the DB schema — so that a json column returns the same
+    // map regardless of the process boundary.
     fn col_type(&self, table: &str, col: &str) -> Option<String> {
         if let Some(t) = self.schema.read().get(table)
             && let Some(c) = t.columns.get(col)
@@ -1676,12 +1677,12 @@ impl Interp {
         self.db_col_type(table, col)
     }
 
-    // DB sxemasini introspeksiya qilib ustun tipini topadi (jadval bo'yicha
-    // cache'lanadi — har qator uchun qayta so'rov bo'lmaydi). DB allaqachon ochiq:
-    // bu metod faqat natija qatorini Value'ga aylantirish paytida chaqiriladi.
+    // Finds the column type by introspecting the DB schema (cached per table —
+    // no re-query for each row). The DB is already open: this method is only
+    // called while converting a result row into a Value.
     //
-    // Tranzaksiya ichida bo'lsa, uncommitted DDL ko'rinishi uchun tx connection
-    // ishlatiladi — global pool connection bu DDL ni ko'ra olmaydi (issue #63).
+    // If inside a transaction, the tx connection is used so that uncommitted DDL
+    // is visible — the global pool connection cannot see this DDL (issue #63).
     fn db_col_type(&self, table: &str, col: &str) -> Option<String> {
         if let Some(entry) = self.db_schema.read().get(table) {
             return entry.get(col).cloned();
@@ -1707,29 +1708,29 @@ impl Interp {
     }
 }
 
-// SqlVal -> Fluxon Value, ustun tipi bo'yicha post-process.
+// SqlVal -> Fluxon Value, post-processed by column type.
 fn sqlval_to_value(cell: SqlVal, col_type: Option<&str>) -> Value {
     let base = match cell {
         SqlVal::Int(n) => Value::Int(n),
         SqlVal::Real(x) => Value::Flt(x),
         SqlVal::Text(s) => Value::Str(s),
-        // BLOB -> bytes (issue #132). Avval lossy matnga buzilardi — endi
-        // ikkilik ma'lumot yo'qotishsiz qaytadi (matn kerak bo'lsa: bytes.str).
+        // BLOB -> bytes (issue #132). It used to be mangled into lossy text — now
+        // binary data is returned losslessly (if text is needed: bytes.str).
         SqlVal::Blob(b) => Value::Bytes(std::sync::Arc::new(b)),
         SqlVal::Null => Value::Nil,
     };
     match (col_type, &base) {
-        // sym ustun: DB matn -> Fluxon symbol.
+        // sym column: DB text -> Fluxon symbol.
         (Some("sym"), Value::Str(s)) => Value::Sym(s.clone()),
-        // json ustun: matn -> dekod qilingan map/list.
+        // json column: text -> decoded map/list.
         (Some("json"), Value::Str(s)) => json_decode(s).unwrap_or(base),
-        // bool ustun: int 0/1 -> bool.
+        // bool column: int 0/1 -> bool.
         (Some("bool"), Value::Int(n)) => Value::Bool(*n != 0),
         _ => base,
     }
 }
 
-// --- argument yordamchilari ---
+// --- argument helpers ---
 
 fn arg_sql(args: &[Value], who: &str) -> Result<String, Flow> {
     match args.first() {
@@ -1762,7 +1763,7 @@ fn arg_map(args: &[Value], i: usize, who: &str) -> Result<BTreeMap<String, Value
     }
 }
 
-// db.q/one ning 2-argumenti: ixtiyoriy params ro'yxati.
+// The 2nd argument of db.q/one: an optional list of params.
 fn arg_params(args: &[Value], i: usize) -> Result<Vec<SqlVal>, Flow> {
     match args.get(i) {
         None | Some(Value::Nil) => Ok(vec![]),
@@ -1774,7 +1775,7 @@ fn arg_params(args: &[Value], i: usize) -> Result<Vec<SqlVal>, Flow> {
     }
 }
 
-// Param qiymatini SqlVal'ga (schema'siz — q/one params ustunsiz).
+// Param value to SqlVal (schema-less — q/one params have no column).
 fn param_to_sqlval(v: &Value) -> Result<SqlVal, Flow> {
     Ok(match v {
         Value::Int(n) => SqlVal::Int(*n),
@@ -1782,10 +1783,10 @@ fn param_to_sqlval(v: &Value) -> Result<SqlVal, Flow> {
         Value::Str(s) => SqlVal::Text(s.clone()),
         Value::Bool(b) => SqlVal::Int(if *b { 1 } else { 0 }),
         Value::Nil => SqlVal::Null,
-        Value::Sym(s) => SqlVal::Text(s.clone()), // symbol -> matn (filter mosligi)
+        Value::Sym(s) => SqlVal::Text(s.clone()), // symbol -> text (filter compatibility)
         Value::Bytes(b) => SqlVal::Blob(b.as_ref().clone()), // bytes -> BLOB (issue #132)
         Value::List(_) | Value::Map(_) => SqlVal::Text(json_encode(v)),
-        // ctx — oddiy map kabi JSON matn (snapshot). json_encode buni hal qiladi.
+        // ctx — JSON text like an ordinary map (snapshot). json_encode handles this.
         Value::Ctx(_) => SqlVal::Text(json_encode(v)),
         Value::Fn(_) | Value::Native(_) => {
             return Err(Flow::err("db: cannot pass a function as a parameter"));
@@ -1793,26 +1794,26 @@ fn param_to_sqlval(v: &Value) -> Result<SqlVal, Flow> {
     })
 }
 
-// SQL'dan asosiy jadval nomini ajratadi: ` from ` dan keyingi identifikator.
-// Join/alias'da cheklov — eng keng tarqalgan `from <table>` holati uchun sym/json
-// konversiya ishlaydi.
+// Extracts the main table name from SQL: the identifier after ` from `.
+// A limitation with join/alias — sym/json conversion works for the most common
+// `from <table>` case.
 //
-// Qidiruv `char`lar ustida bevosita asl `sql` da olib boriladi: `to_lowercase()`
-// ba'zi belgilarda bayt uzunligini o'zgartiradi (masalan `İ` U+0130 → `i̇`),
-// shu sababli lowercase'dan olingan bayt-indeksni asl matnga qo'llash char-chegara
-// panikiga olib keladi (issue #88). Bundan tashqari satr-literal (`'...'`) ichidagi
-// ` from ` e'tiborsiz qoldiriladi — aks holda noto'g'ri jadval nomi olinadi.
+// The search is done directly over the `char`s of the original `sql`: `to_lowercase()`
+// changes the byte length for some characters (for example `İ` U+0130 → `i̇`),
+// so applying a byte index obtained from the lowercase version to the original text
+// leads to a char-boundary panic (issue #88). In addition, a ` from ` inside a
+// string literal (`'...'`) is ignored — otherwise the wrong table name would be taken.
 fn extract_from_table(sql: &str) -> Option<String> {
     let chars: Vec<char> = sql.chars().collect();
     let n = chars.len();
-    let mut in_str = false; // `'` bilan ochilgan SQL satr-literal ichidamizmi
+    let mut in_str = false; // whether we are inside an SQL string literal opened with `'`
     let mut i = 0;
-    // i+5 — ` from ` ning oxirgi bo'shlig'i; shu indeksgача mavjud bo'lishi shart.
+    // i+5 — the last whitespace of ` from `; chars up to this index must exist.
     while i + 5 < n {
         let c = chars[i];
         if in_str {
-            // `''` (literal ichida ikkilangan apostrof) bu yerda ham to'g'ri kuzatiladi:
-            // birinchi `'` literalni yopadi, keyingisi qaytadan ochadi.
+            // `''` (a doubled apostrophe inside a literal) is also tracked correctly here:
+            // the first `'` closes the literal, the next one reopens it.
             if c == '\'' {
                 in_str = false;
             }
@@ -1824,7 +1825,7 @@ fn extract_from_table(sql: &str) -> Option<String> {
             i += 1;
             continue;
         }
-        // <bo'shliq> f r o m <bo'shliq> — katta-kichik harfga sezgir emas.
+        // <whitespace> f r o m <whitespace> — case-insensitive.
         if c.is_whitespace()
             && chars[i + 1].eq_ignore_ascii_case(&'f')
             && chars[i + 2].eq_ignore_ascii_case(&'r')
@@ -1847,17 +1848,17 @@ fn extract_from_table(sql: &str) -> Option<String> {
     None
 }
 
-// ==================== deklarativ o'qish builder'i (issue #78) ====================
+// ==================== declarative read builder (issue #78) ====================
 //
-// Builder holati Value::Map ichida saqlanadi — yangi Value varianti kiritmasdan
-// (Send+Sync, json/display invariantlari avtomat saqlanadi). `__dbq` marker
-// kaliti uni oddiy map'dan ajratadi. Pipe har bosqichni keyingi db.* ning OXIRGI
-// argumenti qiladi (`q |> db.eq {...}` => `db.eq {...} q`), shuning uchun bosqich
-// funksiyalari builder'ni args OXIRIDAN oladi.
+// The builder state is stored inside a Value::Map — without introducing a new
+// Value variant (Send+Sync, json/display invariants are preserved automatically).
+// The `__dbq` marker key distinguishes it from an ordinary map. Pipe makes each
+// stage the LAST argument of the next db.* (`q |> db.eq {...}` => `db.eq {...} q`),
+// so the stage functions take the builder from the END of args.
 
 const DBQ_MARKER: &str = "__dbq";
 
-// Builder map'ni boshlaydi: faqat jadval nomi bilan.
+// Starts the builder map: with only the table name.
 fn db_from(args: Vec<Value>) -> Result<Value, Flow> {
     let table = match args.first() {
         Some(Value::Str(s)) => s.clone(),
@@ -1873,9 +1874,9 @@ fn db_from(args: Vec<Value>) -> Result<Value, Flow> {
     Ok(Value::Map(b))
 }
 
-// Argumentlar OXIRIDAN builder map'ni ajratadi (pipe lhs oxirgi argument).
-// Qaytaradi: (builder_map, qolgan_argumentlar). Builder topilmasa aniq xato —
-// bosqich pipe'siz/db.from'siz chaqirilgan.
+// Splits off the builder map from the END of the arguments (pipe lhs is the last
+// argument). Returns: (builder_map, remaining_arguments). If the builder is not
+// found, a clear error — the stage was called without a pipe / without db.from.
 fn take_builder(
     mut args: Vec<Value>,
     who: &str,
@@ -1889,7 +1890,7 @@ fn take_builder(
     }
 }
 
-// Builder ichidagi list maydonga element qo'shadi (yo'q bo'lsa yaratadi).
+// Adds an element to a list field inside the builder (creates it if absent).
 fn push_into(b: &mut BTreeMap<String, Value>, key: &str, item: Value) {
     match b.get_mut(key) {
         Some(Value::List(xs)) => xs.push(item),
@@ -1899,14 +1900,14 @@ fn push_into(b: &mut BTreeMap<String, Value>, key: &str, item: Value) {
     }
 }
 
-// db.eq {col:val ...} — tenglik filtrlari (AND). List qiymat → IN.
+// db.eq {col:val ...} — equality filters (AND). List value → IN.
 fn db_stage_eq(args: Vec<Value>) -> Result<Value, Flow> {
     let (mut b, rest) = take_builder(args, "db.eq")?;
     let filt = match rest.first() {
         Some(Value::Map(m)) => m.clone(),
         _ => return Err(Flow::err("db.eq: 1st argument must be a map ({...})")),
     };
-    // Mavjud eq map'ga qo'shamiz (bir nechta db.eq chaqirilishi mumkin).
+    // We add to the existing eq map (multiple db.eq calls are possible).
     let mut eq = match b.remove("eq") {
         Some(Value::Map(m)) => m,
         _ => BTreeMap::new(),
@@ -1918,7 +1919,7 @@ fn db_stage_eq(args: Vec<Value>) -> Result<Value, Flow> {
     Ok(Value::Map(b))
 }
 
-// db.cmp :col :op val — bitta taqqoslash (:gt :ge :lt :le :ne :like).
+// db.cmp :col :op val — a single comparison (:gt :ge :lt :le :ne :like).
 fn db_stage_cmp(args: Vec<Value>) -> Result<Value, Flow> {
     let (mut b, rest) = take_builder(args, "db.cmp")?;
     if rest.len() < 3 {
@@ -1933,7 +1934,7 @@ fn db_stage_cmp(args: Vec<Value>) -> Result<Value, Flow> {
         )));
     }
     let val = rest[2].clone();
-    // [col, op, val] uchligi cmp ro'yxatiga.
+    // The [col, op, val] triple into the cmp list.
     push_into(
         &mut b,
         "cmp",
@@ -1960,7 +1961,7 @@ fn db_stage_order(args: Vec<Value>) -> Result<Value, Flow> {
 fn db_stage_limit(args: Vec<Value>) -> Result<Value, Flow> {
     let (mut b, rest) = take_builder(args, "db.limit")?;
     let n = arg_int(rest.first(), "db.limit")?;
-    // Manfiy LIMIT SQLite'da "cheksiz" degani — kutilmagan xulq. Aniq rad et.
+    // A negative LIMIT means "unlimited" in SQLite — unexpected behavior. Reject it explicitly.
     if n < 0 {
         return Err(Flow::err("db.limit: negative value not allowed"));
     }
@@ -1978,7 +1979,7 @@ fn db_stage_offset(args: Vec<Value>) -> Result<Value, Flow> {
     Ok(Value::Map(b))
 }
 
-// db.group :col (yoki list of sym/str).
+// db.group :col (or a list of sym/str).
 fn db_stage_group(args: Vec<Value>) -> Result<Value, Flow> {
     let (mut b, rest) = take_builder(args, "db.group")?;
     let cols: Vec<Value> = match rest.first() {
@@ -1993,10 +1994,10 @@ fn db_stage_group(args: Vec<Value>) -> Result<Value, Flow> {
     Ok(Value::Map(b))
 }
 
-// db.count :out  /  db.sum :col :out  (va avg/min/max).
+// db.count :out  /  db.sum :col :out  (and avg/min/max).
 fn db_stage_agg(args: Vec<Value>, kind: &str, _cond: bool) -> Result<Value, Flow> {
     let (mut b, rest) = take_builder(args, &format!("db.{kind}"))?;
-    // count: faqat :out; boshqalar: :col :out.
+    // count: only :out; others: :col :out.
     let (col, out) = if kind == "count" {
         let out = match rest.first() {
             Some(v) => arg_col(v, "db.count")?,
@@ -2011,7 +2012,7 @@ fn db_stage_agg(args: Vec<Value>, kind: &str, _cond: bool) -> Result<Value, Flow
         }
         (arg_col(&rest[0], "db.agg")?, arg_col(&rest[1], "db.agg")?)
     };
-    // [kind, col, out, filter(yoki nil)].
+    // [kind, col, out, filter (or nil)].
     push_into(
         &mut b,
         "aggs",
@@ -2025,7 +2026,7 @@ fn db_stage_agg(args: Vec<Value>, kind: &str, _cond: bool) -> Result<Value, Flow
     Ok(Value::Map(b))
 }
 
-// db.count_if {filter} :out — shartli sanoq (COUNT(*) FILTER ... CASE WHEN).
+// db.count_if {filter} :out — conditional count (COUNT(*) FILTER ... CASE WHEN).
 fn db_stage_count_if(args: Vec<Value>) -> Result<Value, Flow> {
     let (mut b, rest) = take_builder(args, "db.count_if")?;
     if rest.len() < 2 {
@@ -2055,7 +2056,7 @@ fn db_stage_count_if(args: Vec<Value>) -> Result<Value, Flow> {
     Ok(Value::Map(b))
 }
 
-// db.sum_if :col {filter} :out — shartli yig'indi/o'rtacha.
+// db.sum_if :col {filter} :out — conditional sum/average.
 fn db_stage_agg_if(args: Vec<Value>, kind: &str) -> Result<Value, Flow> {
     let (mut b, rest) = take_builder(args, &format!("db.{kind}_if"))?;
     if rest.len() < 3 {
@@ -2086,16 +2087,16 @@ fn db_stage_agg_if(args: Vec<Value>, kind: &str) -> Result<Value, Flow> {
     Ok(Value::Map(b))
 }
 
-// Terminal rejimi: natija qanday qaytadi.
+// Terminal mode: how the result is returned.
 #[derive(Clone, Copy, PartialEq)]
 enum RunMode {
     All,    // list of maps
-    First,  // bitta map yoki nil
-    Agg,    // group bo'yicha list of maps
-    AggRow, // bitta agg qator (group'siz)
+    First,  // a single map or nil
+    Agg,    // list of maps by group
+    AggRow, // a single agg row (no group)
 }
 
-// Sym operatorni SQL operatoriga.
+// Sym operator to SQL operator.
 fn cmp_sql_op(op: &str) -> Option<&'static str> {
     Some(match op {
         "gt" => ">",
@@ -2108,9 +2109,9 @@ fn cmp_sql_op(op: &str) -> Option<&'static str> {
     })
 }
 
-// --- builder argument yordamchilari ---
+// --- builder argument helpers ---
 
-// Ustun nomi: sym (:col) yoki str ("col").
+// Column name: sym (:col) or str ("col").
 fn arg_col(v: &Value, who: &str) -> Result<String, Flow> {
     match v {
         Value::Sym(s) | Value::Str(s) => Ok(s.clone()),
@@ -2140,14 +2141,15 @@ fn arg_int(v: Option<&Value>, who: &str) -> Result<i64, Flow> {
 mod tests {
     use super::*;
 
-    // Bu modul testlari haqiqiy DB ochadi. `:memory:` aslida JARAYON BO'YLAB
-    // bitta umumiy shared-cache DB (Pool izohi: `file::memory:?cache=shared`) —
-    // shu sabab `CREATE TABLE` qiluvchi testlar parallel ishlaganda jadval-nomi
-    // ("table ... already exists") yoki shared-cache table-lock ("database
-    // table is locked") to'qnashuvi flaky qiladi (issue #145). Yechim: har test
-    // NOYOB nomli shared-cache memory DB ishlatsin (pool bir nechta connection
-    // ochadi → shared-cache shart; unikal nom → testlar bir-birini ko'rmaydi).
-    // `mem_db(name)` shu naqshni markazlashtiradi; nom test ichida unikal bo'lsin.
+    // The tests in this module open a real DB. `:memory:` is actually one shared
+    // shared-cache DB ACROSS THE PROCESS (Pool note: `file::memory:?cache=shared`) —
+    // so tests that do `CREATE TABLE` get a table-name collision
+    // ("table ... already exists") or a shared-cache table-lock ("database
+    // table is locked") when run in parallel, which makes them flaky (issue #145).
+    // Solution: each test should use a UNIQUELY named shared-cache memory DB (the
+    // pool opens multiple connections → shared-cache is required; a unique name →
+    // tests do not see each other). `mem_db(name)` centralizes this pattern; the
+    // name must be unique within the test.
     fn mem_db(name: &str) -> SqliteDb {
         SqliteDb::open(&format!("file:{name}?mode=memory&cache=shared")).unwrap()
     }
@@ -2162,7 +2164,7 @@ mod tests {
 
     #[test]
     fn index_name_short_passthrough() {
-        // Qisqa nom o'zgarmaydi — to'liq logik nom ishlatiladi.
+        // A short name does not change — the full logical name is used.
         assert_eq!(
             index_name(&idx("bookings", &["status"], false)),
             "idx_bookings_status"
@@ -2175,7 +2177,7 @@ mod tests {
 
     #[test]
     fn index_name_long_truncates_deterministically() {
-        // 63 baytdan oshadigan uzun nom -> qisqartirilgan + hash suffiks.
+        // A long name exceeding 63 bytes -> truncated + hash suffix.
         let long_table = "very_long_table_name_for_appointments_and_bookings";
         let long = idx(
             long_table,
@@ -2196,8 +2198,8 @@ mod tests {
 
     #[test]
     fn index_name_long_no_collision() {
-        // Bir xil qisqa prefiksga tushadigan ikki turli uzun index to'qnashmaydi
-        // (hash to'liq logik nomdan olinadi).
+        // Two different long indexes that fall onto the same short prefix do not
+        // collide (the hash is derived from the full logical name).
         let t = "extremely_long_table_name_that_definitely_exceeds_the_limit_xx";
         let a = index_name(&idx(t, &["column_alpha"], false));
         let b = index_name(&idx(t, &["column_beta"], false));
@@ -2210,7 +2212,7 @@ mod tests {
 
     #[test]
     fn index_name_unique_vs_nonunique_differ() {
-        // uniq va index bir xil ustunlarda turli nom (prefiks) beradi.
+        // uniq and index on the same columns yield different names (prefixes).
         let u = index_name(&idx("t", &["a"], true));
         let i = index_name(&idx("t", &["a"], false));
         assert_ne!(u, i);
@@ -2228,7 +2230,7 @@ mod tests {
 
     #[test]
     fn coldef_fk_parsing() {
-        // `ref:tbl.col` modifikatori ForeignKey ga to'g'ri ajraladi.
+        // The `ref:tbl.col` modifier parses correctly into a ForeignKey.
         let c = col("owner", "int", &["ref:users.id"]);
         assert_eq!(
             coldef_foreign_key(&c),
@@ -2243,7 +2245,7 @@ mod tests {
 
     #[test]
     fn column_def_emits_references() {
-        // ref:tbl.col -> ustun DDL'da REFERENCES bo'lishi kerak.
+        // ref:tbl.col -> the column DDL must contain REFERENCES.
         let ddl = sqlite_column_def(&col("owner", "int", &["ref:users.id"]));
         assert!(
             ddl.contains("REFERENCES \"users\"(\"id\")"),
@@ -2253,10 +2255,10 @@ mod tests {
 
     #[test]
     fn rebuild_preserves_data_and_adds_fk() {
-        // rebuild_table: mavjud ustunga FK qo'shadi, ma'lumotni saqlaydi,
-        // foreign_keys() introspeksiyasi yangi FK'ni ko'radi.
+        // rebuild_table: adds an FK to an existing column, preserves the data,
+        // and the foreign_keys() introspection sees the new FK.
         let db = mem_db("rebuild_fk_test");
-        // Parent + child (FK'siz) + ma'lumot.
+        // Parent + child (without FK) + data.
         db.exec(
             "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
             &[],
@@ -2280,7 +2282,7 @@ mod tests {
             "no FK at the start"
         );
 
-        // Rebuild: owner ga ref:users.id.
+        // Rebuild: ref:users.id on owner.
         let cols = vec![
             col("id", "serial", &["pk"]),
             col("owner", "int", &["ref:users.id"]),
@@ -2288,23 +2290,23 @@ mod tests {
         ];
         db.rebuild_table("posts", &cols, &[], 42).unwrap();
 
-        // FK qo'shildi.
+        // The FK was added.
         let fks = db.foreign_keys("posts").unwrap();
         assert_eq!(fks.len(), 1);
         assert_eq!(fks[0].from, "owner");
         assert_eq!(fks[0].table, "users");
-        // Ma'lumot saqlandi.
+        // The data was preserved.
         let rows = db.query("SELECT title FROM posts", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        // FK endi enforce qilinadi (yetim insert rad etiladi).
+        // The FK is now enforced (an orphan insert is rejected).
         let orphan = db.exec("INSERT INTO posts (owner, title) VALUES (999, 'y')", &[]);
         assert!(orphan.is_err(), "orphan insert must violate the FK");
     }
 
     #[test]
     fn rebuild_twice_same_ts_no_backup_collision() {
-        // Codex revyu: bir jadval bir sekundda (bir xil `ts`) ikki marta rebuild
-        // bo'lsa (ref qo'shish -> tez orada olib tashlash), backup nomi to'qnashmasin.
+        // Codex review: if a table is rebuilt twice within one second (the same `ts`)
+        // (add ref -> remove it shortly after), the backup names must not collide.
         let db = mem_db("rebuild_ts_test");
         db.exec("CREATE TABLE users (id INTEGER PRIMARY KEY)", &[])
             .unwrap();
@@ -2323,14 +2325,14 @@ mod tests {
         ];
         let no_fk = vec![col("id", "serial", &["pk"]), col("owner", "int", &[])];
 
-        // 1-rebuild: FK qo'shadi (bir xil ts=7).
+        // 1st rebuild: adds the FK (same ts=7).
         db.rebuild_table("posts", &with_fk, &[], 7).unwrap();
         assert_eq!(db.foreign_keys("posts").unwrap().len(), 1);
-        // 2-rebuild: AYNAN o'sha ts bilan FK olib tashlaydi — to'qnashuvsiz o'tishi kerak.
+        // 2nd rebuild: removes the FK with the EXACT same ts — must pass without a collision.
         db.rebuild_table("posts", &no_fk, &[], 7).unwrap();
         assert!(db.foreign_keys("posts").unwrap().is_empty());
 
-        // Ikkala backup ham saqlangan (turli nom: `_fk` va `_fk_2`).
+        // Both backups are preserved (different names: `_fk` and `_fk_2`).
         let baks = db
             .query(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '_fluxon_bak_posts_7_fk%' ORDER BY name",
@@ -2342,13 +2344,13 @@ mod tests {
             2,
             "two rebuilds must leave two separate backups"
         );
-        // Ma'lumot saqlangan.
+        // The data is preserved.
         assert_eq!(db.query("SELECT id FROM posts", &[]).unwrap().len(), 1);
     }
 
     #[test]
     fn extract_from_table_basic() {
-        // Oddiy holatlar: katta-kichik harf va keyingi bandlar (where) ajraladi.
+        // Simple cases: case insensitivity and following clauses (where) are separated.
         assert_eq!(
             extract_from_table("select * from users"),
             Some("users".to_string())
@@ -2362,13 +2364,13 @@ mod tests {
 
     #[test]
     fn extract_from_table_unicode_no_panic() {
-        // Issue #88: lowercase'da bayt uzunligini o'zgartiruvchi belgilar
-        // (masalan `İ` U+0130) char-chegara panikiga olib kelmasligi kerak.
+        // Issue #88: characters that change byte length under lowercase
+        // (for example `İ` U+0130) must not lead to a char-boundary panic.
         assert_eq!(
             extract_from_table("select İİ from té"),
             Some("té".to_string())
         );
-        // Jadval nomidan oldin ham Unicode bo'lsa panik bo'lmasin.
+        // There must be no panic when there is Unicode before the table name too.
         assert_eq!(
             extract_from_table("select * from naïve_таблица"),
             Some("naïve_таблица".to_string())
@@ -2377,17 +2379,17 @@ mod tests {
 
     #[test]
     fn extract_from_table_ignores_string_literal() {
-        // Issue #88 qo'shimcha: satr-literal (`'...'`) ichidagi ` from ` jadval
-        // nomi deb olinmasligi kerak — haqiqiy FROM bandidagi nom topiladi.
+        // Issue #88 addition: a ` from ` inside a string literal (`'...'`) must not
+        // be taken as the table name — the name in the actual FROM clause is found.
         assert_eq!(
             extract_from_table("select * from posts where body like '% from secret %'"),
             Some("posts".to_string())
         );
-        // Literal ichida ` from ` bo'lsa-yu, undan tashqarida FROM bo'lmasa — None.
+        // If there is a ` from ` inside a literal but no FROM outside it — None.
         assert_eq!(extract_from_table("select '% from x %'"), None);
     }
 
-    // Qatordan int qiymat oladi (SqlVal PartialEq emas — match orqali).
+    // Gets an int value from a row (SqlVal is not PartialEq — via match).
     fn row_int(rows: &[Row], col: &str) -> i64 {
         match rows[0].get(col) {
             Some(SqlVal::Int(n)) => *n,
@@ -2397,10 +2399,10 @@ mod tests {
 
     #[test]
     fn commit_failure_returns_clean_connection_to_pool() {
-        // Issue #103: COMMIT xato bo'lsa (deferred FK buzilishida tranzaksiya
-        // ochiq qoladi) connection poolga ROLLBACK qilinib qaytishi kerak —
-        // aks holda keyingi begin() "cannot start a transaction within a
-        // transaction" oladi.
+        // Issue #103: if COMMIT errors (on a deferred FK violation the transaction
+        // stays open) the connection must be ROLLBACK'd and returned to the pool —
+        // otherwise the next begin() gets "cannot start a transaction within a
+        // transaction".
         let db = mem_db("commit_failure_clean_conn");
         db.exec("CREATE TABLE p (id INTEGER PRIMARY KEY)", &[])
             .unwrap();
@@ -2411,19 +2413,19 @@ mod tests {
         .unwrap();
 
         let tx = db.begin().unwrap();
-        // Deferred FK: buzilish COMMIT paytida aniqlanadi va COMMIT yiqiladi.
+        // Deferred FK: the violation is detected at COMMIT time and COMMIT fails.
         tx.exec("INSERT INTO c (pid) VALUES (999)", &[]).unwrap();
         assert!(
             tx.commit().is_err(),
             "deferred FK violation must cause a COMMIT error"
         );
 
-        // Connection poolga TOZA qaytgan: yangi tx ochiladi (iflos bo'lsa shu
-        // yerda "within a transaction" xatosi chiqardi)...
+        // Returned CLEAN to the connection pool: a new tx opens (if it were dirty,
+        // a "within a transaction" error would appear here)...
         let tx2 = db
             .begin()
             .unwrap_or_else(|e| panic!("dirty connection returned to the pool: {e}"));
-        // ...va yetim yozuv rollback bo'lgan (eski ochiq tx'ga oqib ketmagan).
+        // ...and the orphan record was rolled back (it did not leak into the old open tx).
         let rows = tx2.query("SELECT count(*) AS n FROM c", &[]).unwrap();
         assert_eq!(row_int(&rows, "n"), 0, "orphan record must be rolled back");
         tx2.rollback().unwrap();
@@ -2431,11 +2433,12 @@ mod tests {
 
     #[test]
     fn global_query_works_while_tx_holds_connection() {
-        // Pool dizaynining asosiy va'dasi: tx connection'ni egallab turganda
-        // global (tx'siz) so'rov pooldan BOSHQA connection olib ishlayveradi va
-        // uncommitted yozuvni ko'rmaydi. WAL snapshot kerak — fayl DB ishlatamiz
-        // (shared-cache :memory: WAL'ni qo'llamaydi). Fayl nomiga PID qo'shamiz:
-        // bir vaqtda ikki `cargo test` jarayoni bo'lsa ham fayl to'qnashmasin.
+        // The core promise of the pool design: while a tx holds a connection, a
+        // global (tx-less) query keeps working by taking ANOTHER connection from the
+        // pool and does not see the uncommitted record. A WAL snapshot is needed —
+        // we use a file DB (shared-cache :memory: does not support WAL). We add the
+        // PID to the file name: so the file does not collide even if two `cargo test`
+        // processes run at once.
         let path = std::env::temp_dir().join(format!(
             "fluxon_dbmod_pool_promise_{}.db",
             std::process::id()
@@ -2450,7 +2453,7 @@ mod tests {
         let tx = db.begin().unwrap();
         tx.exec("INSERT INTO t (id) VALUES (2)", &[]).unwrap();
 
-        // tx hali ochiq — global so'rov bloklanmaydi, eski snapshot'ni ko'radi.
+        // tx is still open — the global query is not blocked, it sees the old snapshot.
         let rows = db.query("SELECT count(*) AS n FROM t", &[]).unwrap();
         assert_eq!(
             row_int(&rows, "n"),
@@ -2469,9 +2472,9 @@ mod tests {
 
     #[test]
     fn tx_guard_clears_thread_local_on_panic() {
-        // Issue #103 (bog'liq): lambda ichida Rust-darajali panic bo'lsa guard
-        // CURRENT_TX'ni tozalashi kerak — spawn_blocking thread'i qayta
-        // ishlatilganda keyingi request eski tx ichida qolib ketmasin.
+        // Issue #103 (related): if a Rust-level panic happens inside the lambda the
+        // guard must clear CURRENT_TX — so that when the spawn_blocking thread is
+        // reused, the next request does not stay inside the old tx.
         let db = mem_db("tx_guard_clears_tl");
         db.exec("CREATE TABLE t (id INTEGER)", &[]).unwrap();
 
@@ -2486,8 +2489,8 @@ mod tests {
             CURRENT_TX.with(|c| c.borrow().is_none()),
             "guard must clear CURRENT_TX"
         );
-        // tx Drop orqali rollback bo'lib connection poolga qaytgan — yangi tx
-        // muammosiz ochiladi.
+        // tx was rolled back via Drop and returned to the connection pool — a new tx
+        // opens without trouble.
         let tx2 = db.begin().unwrap();
         tx2.rollback().unwrap();
     }

@@ -55,26 +55,27 @@ impl Interp {
             return Ok(Value::List(Vec::new()));
         }
 
-        // db.tx ichidan par CHAQIRIB BO'LMAYDI: tranzaksiya joriy thread'ning
-        // `CURRENT_TX` TLS'ida turadi va yangi thread'lar uni meros qilmaydi —
-        // par lambda'lari jim ravishda tranzaksiyadan TASHQARIDA (global DB,
-        // commit qilinmagan o'zgarishlarni ko'rmay) ishlardi, db.tx atomiklik/
-        // read-your-writes semantikasini buzib. SQLite connection thread-safe
-        // bo'lmagani uchun tx'ni ulashib ham bo'lmaydi. Jim noto'g'ri ishlash
-        // o'rniga aniq xato beramiz (issue #137 PR review, P1).
+        // par CANNOT be called inside db.tx: the transaction lives in the current
+        // thread's `CURRENT_TX` TLS and new threads do not inherit it — par
+        // lambdas would silently run OUTSIDE the transaction (against the global
+        // DB, not seeing uncommitted changes), breaking db.tx atomicity /
+        // read-your-writes semantics. SQLite connections are not thread-safe, so
+        // the tx cannot be shared either. Instead of working silently wrong we
+        // give an explicit error (issue #137 PR review, P1).
         if crate::db_mod::tx_active() {
             return Err(Flow::err(
                 "par: cannot be used inside db.tx (the transaction is not shared across threads); call it outside the tx",
             ));
         }
 
-        // Har lambdani alohida thread'da chaqiramiz. Thread `Arc<Interp>` klonini
-        // ushlaydi (zaif emas — chaqiruv davomida tirik turishi kafolatlangan).
-        // `current_base` thread-local, yangi thread default CWD'dan boshlanadi —
-        // shuning uchun joriy base'ni SNAPSHOT qilib lambda thread'iga uzatamiz,
-        // aks holda lambda ichidan `use ./...` noto'g'ri katalogga nisbatan hal
-        // qilinardi (modul ichidan par chaqirilganda). Sikl-detektsiya steki esa
-        // yangi thread'da bo'sh boshlanadi — bu to'g'ri (har lambda mustaqil zanjir).
+        // We call each lambda on a separate thread. The thread holds a clone of
+        // `Arc<Interp>` (not weak — guaranteed alive for the duration of the
+        // call). `current_base` is thread-local and a new thread starts from the
+        // default CWD — so we SNAPSHOT the current base and pass it to the lambda
+        // thread, otherwise a `use ./...` inside the lambda would resolve against
+        // the wrong directory (when par is called from inside a module). The
+        // cycle-detection stack, by contrast, starts empty on the new thread —
+        // which is correct (each lambda is an independent chain).
         let base = self.base_dir();
         let handles: Vec<_> = list
             .into_iter()
@@ -88,13 +89,13 @@ impl Interp {
             })
             .collect();
 
-        // Kirish tartibida join qilamiz — natija ro'yxati lambdalar tartibiga mos.
+        // We join in input order — the result list matches the lambda order.
         let mut out = Vec::with_capacity(handles.len());
         for h in handles {
             let cell = match h.join() {
-                // Lambda muvaffaqiyatli yoki Flow xato qaytardi.
+                // The lambda returned successfully or with a Flow error.
                 Ok(res) => flow_to_cell(res),
-                // Thread panic qildi (apply ichida kutilmagan panic) — xato cell.
+                // The thread panicked (an unexpected panic inside apply) — error cell.
                 Err(_) => err_cell("par: an inner thread panicked"),
             };
             out.push(cell);
@@ -103,18 +104,18 @@ impl Interp {
     }
 }
 
-// `apply` natijasini `{ok:...}` yoki `{err:...}` map'ga aylantiradi. `apply`
-// `Flow::Return`ni allaqachon `Ok`ga normallashtirgan; shu yerga faqat haqiqiy
-// natija yoki `Fail`/`Error`/`Skip`/`Stop` keladi. `skip`/`stop` lambda ichida
-// ma'nosiz (loop yo'q) — ularni ham xato deb belgilaymiz.
+// Turns the `apply` result into an `{ok:...}` or `{err:...}` map. `apply` has
+// already normalized `Flow::Return` to `Ok`; only a real result or
+// `Fail`/`Error`/`Skip`/`Stop` reaches here. `skip`/`stop` are meaningless
+// inside a lambda (no loop) — we mark them as errors too.
 fn flow_to_cell(res: Result<Value, Flow>) -> Value {
     match res {
         Ok(v) => ok_cell(v),
         Err(Flow::Fail { message, .. }) | Err(Flow::Error(message)) => err_cell(message),
         Err(Flow::Skip) => err_cell("par: `skip` inside a lambda (no loop)"),
         Err(Flow::Stop) => err_cell("par: `stop` inside a lambda (no loop)"),
-        // Return apply tomonidan Ok'ga aylantirilgan — bu shoxga yetmaydi, lekin
-        // to'liqlik uchun qiymatini ok cell qilamiz.
+        // Return is converted to Ok by apply — this arm is unreachable, but for
+        // completeness we wrap its value in an ok cell.
         Err(Flow::Return(v)) => ok_cell(v),
     }
 }
@@ -166,7 +167,7 @@ mod tests {
         assert_eq!(cell_kind(&flow_to_cell(Err(Flow::err("broke")))), "err");
     }
 
-    // skip/stop lambda ichida loop yo'q — xato cell.
+    // skip/stop inside a lambda — no loop, so error cell.
     #[test]
     fn skip_stop_err_cell() {
         assert_eq!(cell_kind(&flow_to_cell(Err(Flow::Skip))), "err");

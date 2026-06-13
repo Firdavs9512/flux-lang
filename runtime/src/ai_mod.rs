@@ -1300,8 +1300,8 @@ mod tests {
 
     #[test]
     fn wrap_passthrough_full_schema() {
-        // Allaqachon type:object bo'lsa, tegilmaydi.
-        // (Value Debug/PartialEq derive qilmaydi -> .equals bilan solishtiramiz.)
+        // Already a type:object schema -> left as-is.
+        // (Value does not derive Debug/PartialEq -> we compare with .equals.)
         let mut s = BTreeMap::new();
         s.insert("type".to_string(), Value::Str("object".to_string()));
         s.insert("properties".to_string(), Value::Map(BTreeMap::new()));
@@ -1329,7 +1329,7 @@ mod tests {
 
     #[test]
     fn normalize_tool_msg() {
-        // {role::tool id content} -> user + tool_result blok.
+        // {role::tool id content} -> user + tool_result block.
         let mut t = BTreeMap::new();
         t.insert("role".to_string(), Value::Sym("tool".to_string()));
         t.insert("id".to_string(), Value::Str("toolu_1".to_string()));
@@ -1360,7 +1360,7 @@ mod tests {
 
     #[test]
     fn normalize_sym_role() {
-        // {role::user content} -> role str'ga aylanadi.
+        // {role::user content} -> role is turned into a str.
         let mut t = BTreeMap::new();
         t.insert("role".to_string(), Value::Sym("user".to_string()));
         t.insert("content".to_string(), Value::Str("hello".to_string()));
@@ -1378,7 +1378,7 @@ mod tests {
             "usage": {"input_tokens": 10, "output_tokens": 5},
             "content": [{"type": "text", "text": "answer"}]
         }"#;
-        // Flow Debug derive qilmaydi -> .unwrap() o'rniga match.
+        // Flow does not derive Debug -> match instead of .unwrap().
         let r = match parse_anthropic(json, "claude-opus-4-8", 100) {
             Ok(r) => r,
             Err(_) => panic!("parse failed"),
@@ -1418,8 +1418,8 @@ mod tests {
 
     #[test]
     fn parse_parallel_tool_use() {
-        // Model bir javobda IKKI tool chaqirsa, ikkalasi ham yig'iladi
-        // (issue #95 — ilgari faqat oxirgisi qolardi).
+        // If the model calls TWO tools in one response, both are collected
+        // (issue #95 — previously only the last one would remain).
         let json = r#"{
             "stop_reason": "tool_use",
             "usage": {"input_tokens": 20, "output_tokens": 8},
@@ -1453,7 +1453,7 @@ mod tests {
         let m = r.meta();
         assert!(as_int(m.get("tokens").unwrap()) == Some(1500));
         assert!(as_int(m.get("ms").unwrap()) == Some(1234));
-        // narx: (1000*5 + 500*25)/1e6 = (5000+12500)/1e6 = 0.0175
+        // cost: (1000*5 + 500*25)/1e6 = (5000+12500)/1e6 = 0.0175
         match m.get("cost").unwrap() {
             Value::Flt(c) => assert!((c - 0.0175).abs() < 1e-9),
             _ => panic!(),
@@ -1472,7 +1472,7 @@ mod tests {
 
     #[test]
     fn parse_openai_text() {
-        // OpenAI Chat Completions text javobi.
+        // OpenAI Chat Completions text response.
         let json = r#"{
             "choices": [{
                 "finish_reason": "stop",
@@ -1492,7 +1492,7 @@ mod tests {
 
     #[test]
     fn parse_openai_tool_call() {
-        // OpenAI tool_calls: arguments JSON-STRING -> map'ga parse bo'ladi.
+        // OpenAI tool_calls: arguments JSON-STRING -> is parsed into a map.
         let json = r#"{
             "choices": [{
                 "finish_reason": "tool_calls",
@@ -1529,8 +1529,8 @@ mod tests {
 
     #[test]
     fn parse_openai_parallel_tool_calls() {
-        // OpenAI ham bir javobda bir nechta tool_call qaytarishi mumkin —
-        // hammasi yig'iladi (issue #95).
+        // OpenAI may also return several tool_call entries in one response —
+        // all are collected (issue #95).
         let json = r#"{
             "choices": [{
                 "finish_reason": "tool_calls",
