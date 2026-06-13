@@ -71,11 +71,21 @@ impl Interp {
 
         // Har lambdani alohida thread'da chaqiramiz. Thread `Arc<Interp>` klonini
         // ushlaydi (zaif emas — chaqiruv davomida tirik turishi kafolatlangan).
+        // `current_base` thread-local, yangi thread default CWD'dan boshlanadi —
+        // shuning uchun joriy base'ni SNAPSHOT qilib lambda thread'iga uzatamiz,
+        // aks holda lambda ichidan `use ./...` noto'g'ri katalogga nisbatan hal
+        // qilinardi (modul ichidan par chaqirilganda). Sikl-detektsiya steki esa
+        // yangi thread'da bo'sh boshlanadi — bu to'g'ri (har lambda mustaqil zanjir).
+        let base = self.base_dir();
         let handles: Vec<_> = list
             .into_iter()
             .map(|f| {
                 let interp = self.clone();
-                std::thread::spawn(move || interp.apply(f, Vec::new()))
+                let base = base.clone();
+                std::thread::spawn(move || {
+                    interp.set_base(&base);
+                    interp.apply(f, Vec::new())
+                })
             })
             .collect();
 

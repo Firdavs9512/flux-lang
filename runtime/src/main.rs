@@ -539,6 +539,39 @@ r = par []
         );
     }
 
+    // Issue #137 (PR review P2): ikki par lambda bir xil CACHE'LANMAGAN modulni
+    // parallel `use ./m` qilsa, ikkalasi ham {ok:...} qaytishi kerak — soxta
+    // "sikllik import" emas. module_loading/current_base thread-local bo'lgani
+    // uchun parallel import bir-birini sikl deb ko'rmaydi va base buzilmaydi.
+    #[test]
+    fn par_parallel_modul_import_soxta_sikl_yoq() {
+        let dir = std::env::temp_dir().join(format!("fluxon_par_mod_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("m.fx"), "exp fn greet n -> \"salom ${n}\"\n").unwrap();
+        let main = dir.join("main.fx");
+        // Har lambda alohida thread'da MODULNI BIRINCHI MARTA import qiladi
+        // (cache bo'sh) — Codex reproduksiyasi.
+        std::fs::write(
+            &main,
+            r#"
+fn load n
+  use ./m
+  ret m.greet n
+r = par [
+  (\-> load 1)
+  (\-> load 2)
+]
+((r.0.ok) == "salom 1") | (fail "par modul import 1 buzildi: ${r.0}")
+((r.1.ok) == "salom 2") | (fail "par modul import 2 buzildi: ${r.1}")
+"#,
+        )
+        .unwrap();
+        let src = std::fs::read_to_string(&main).unwrap();
+        let res = run_source_at(&src, &main);
+        let _ = std::fs::remove_dir_all(&dir);
+        res.unwrap_or_else(|e| panic!("par parallel modul import xatosi: {}", e));
+    }
+
     // Issue #137: foydalanuvchi `par` nomli o'zgaruvchi e'lon qilsa u ustun
     // (boshqa dispatch-battery'lar bilan izchil shadowing).
     #[test]

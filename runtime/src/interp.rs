@@ -190,6 +190,18 @@ thread_local! {
     // o'z spawn_blocking thread'ida — bir request'ning rekursiyasi boshqasini
     // sanamaydi. Interp'ga maydon qo'shib bo'lmaydi (&self, Sync — Cell mumkin emas).
     static CALL_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
+    // `use ./fayl` joriy fayl katalogi va sikl-detektsiya steki — THREAD-LOCAL
+    // (Interp maydoni emas). `par` har lambdani alohida thread'da chaqiradi,
+    // shuning uchun parallel modul yuklash bir-birining base/in-flight steki'ni
+    // buzmasin. Base default — joriy ish katalogi (`set_base` top-level faylga
+    // aniqlashtiradi); `par` ota-thread base'ini yangi thread'ga snapshot qiladi.
+    // Loading steki har thread'da bo'sh boshlanadi (har par lambda mustaqil import
+    // zanjiri). module_cache esa Interp'da shared — yuklangan modul ulashiladi.
+    static CURRENT_BASE: std::cell::RefCell<PathBuf> =
+        std::cell::RefCell::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    static MODULE_LOADING: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 // RAII guard: enter'da hisoblagichni oshiradi, Drop'da kamaytiradi. Drop'siz
@@ -292,13 +304,15 @@ pub struct Interp {
     // namespace (`Value::Map`). Bir modul ikki marta import qilinsa qayta
     // bajarilmaydi — bir marta run qilinib natija shu yerda saqlanadi (idempotent).
     module_cache: Mutex<HashMap<PathBuf, Value>>,
-    // Hozir yuklanayotgan modullar steki (canonical yo'llar) — sikllik importni
-    // (A -> B -> A) aniqlash uchun. Modul run boshida push, tugaganda pop.
-    module_loading: Mutex<Vec<PathBuf>>,
-    // Joriy bajarilayotgan faylning katalogi. `use ./fayl` yo'lini shunga nisbatan
-    // hal qiladi. Nested import uchun save/restore steki kabi ishlaydi: modul run
-    // qilinganda uning katalogiga o'rnatiladi, tugagach tiklanadi.
-    current_base: Mutex<PathBuf>,
+    // module_loading (sikl detektsiya steki) va current_base (joriy fayl katalogi)
+    // PROCESS-WIDE Mutex emas, THREAD-LOCAL (CURRENT_BASE/MODULE_LOADING, quyida).
+    // Sabab: `par` har lambdani alohida thread'da chaqiradi — ikki lambda bir xil
+    // cache'lanmagan modulni `use ./m` qilsa, process-wide stack birining in-flight
+    // yo'lini ikkinchisiga sikl deb ko'rsatardi (soxta "sikllik import"), va
+    // parallel base save/restore bir-birini buzardi (issue #137 PR review).
+    // Sikl bir IMPORT ZANJIRIDA (bir thread) bo'ladi, base ham joriy bajarilish
+    // konteksti — ikkalasi tabiatan thread-local (CURRENT_TX kabi). module_cache
+    // esa SHARED qoladi: modul bir marta yuklanib hamma thread ulashadi.
 }
 
 // tbl ustun metasi — tip nomi (sym/json/bool konversiya) + modifikatorlar
@@ -340,26 +354,21 @@ impl Interp {
             queue: Arc::new(crate::queue_mod::QueueState::new()),
             pending_servers: Arc::new(Mutex::new(Vec::new())),
             module_cache: Mutex::new(HashMap::new()),
-            module_loading: Mutex::new(Vec::new()),
-            // Boshlang'ich base — joriy ish katalogi. `set_base` top-level fayl
-            // katalogiga aniqlashtiradi (main.rs).
-            current_base: Mutex::new(
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            ),
+            // module_loading/current_base — thread-local (yuqoridagi izoh).
         }
     }
 
     // Top-level faylning katalogini o'rnatadi — `use ./fayl` yo'llari shunga
     // nisbatan hal qilinadi. main.rs `run`dan oldin bir marta chaqiradi.
     pub fn set_base(&self, dir: &std::path::Path) {
-        *self.current_base.lock().unwrap() = dir.to_path_buf();
+        CURRENT_BASE.with(|b| *b.borrow_mut() = dir.to_path_buf());
     }
 
     // Joriy bajarilayotgan faylning katalogi. pub(crate): `http.static` nisbiy
     // katalogni (`"./public"`) `use ./fayl` bilan bir xil qoidada — skript fayli
     // katalogiga nisbatan — hal qiladi.
     pub(crate) fn base_dir(&self) -> PathBuf {
-        self.current_base.lock().unwrap().clone()
+        CURRENT_BASE.with(|b| b.borrow().clone())
     }
 
     // `env.NOM` qiymatini topadi. Ustunlik: OS env (std::env) > .env fayl.
@@ -751,7 +760,7 @@ impl Interp {
     // kiradi (qolganlari modul-private).
     fn load_module(&self, rel_path: &str) -> EvalResult {
         // 1. To'liq yo'lni quramiz: base + nisbiy yo'l, .fx kengaytmasi qo'shamiz.
-        let base = self.current_base.lock().unwrap().clone();
+        let base = self.base_dir();
         let mut full = base.join(rel_path);
         if full.extension().is_none() {
             full.set_extension("fx");
@@ -769,24 +778,31 @@ impl Interp {
             return Ok(v.clone());
         }
 
-        // 3. Sikllik import: agar bu modul hozir yuklanish jarayonida bo'lsa
-        //    (A -> B -> A), to'xtaymiz — aks holda cheksiz rekursiya.
-        {
-            let loading = self.module_loading.lock().unwrap();
-            if loading.contains(&canon) {
-                let chain: Vec<String> = loading
+        // 3. Sikllik import: agar bu modul SHU THREAD'DA hozir yuklanish
+        //    jarayonida bo'lsa (A -> B -> A), to'xtaymiz — aks holda cheksiz
+        //    rekursiya. Steki thread-local: `par` parallel import'lari bir-birini
+        //    sikl deb ko'rmaydi (har lambda mustaqil zanjir).
+        let cycle = MODULE_LOADING.with(|l| {
+            let loading = l.borrow();
+            loading.contains(&canon).then(|| {
+                loading
                     .iter()
                     .chain(std::iter::once(&canon))
                     .map(|p| p.display().to_string())
-                    .collect();
-                return Err(Flow::err(format!("sikllik import: {}", chain.join(" -> "))));
-            }
+                    .collect::<Vec<_>>()
+                    .join(" -> ")
+            })
+        });
+        if let Some(chain) = cycle {
+            return Err(Flow::err(format!("sikllik import: {}", chain)));
         }
-        self.module_loading.lock().unwrap().push(canon.clone());
+        MODULE_LOADING.with(|l| l.borrow_mut().push(canon.clone()));
 
         // 4. Faylni bajaramiz. Natijadan qat'i nazar steki'dan olib tashlaymiz.
         let result = self.run_module_file(&canon);
-        self.module_loading.lock().unwrap().pop();
+        MODULE_LOADING.with(|l| {
+            l.borrow_mut().pop();
+        });
         let ns = result?;
 
         // 5. Cache'ga yozamiz (closure Arc'lar shared — ikkinchi import klon oladi).
@@ -816,12 +832,12 @@ impl Interp {
         // base'ni modul katalogiga o'rnatamiz — modul ichidagi `use ./...` shu
         // modulga nisbatan hal qilinsin. Save/restore: nested import qaytib
         // chiqqanda ota-modul base'i tiklanadi (xato yo'lida ham).
-        let prev_base = self.current_base.lock().unwrap().clone();
+        let prev_base = self.base_dir();
         if let Some(dir) = canon.parent() {
-            *self.current_base.lock().unwrap() = dir.to_path_buf();
+            self.set_base(dir);
         }
         let exec = self.exec_module_body(&prog, &mod_scope);
-        *self.current_base.lock().unwrap() = prev_base;
+        self.set_base(&prev_base);
         exec?;
 
         // Faqat eksport qilingan nomlarni yig'amiz: `exp NAME =` va `exp fn`.

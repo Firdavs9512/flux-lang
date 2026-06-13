@@ -32,6 +32,17 @@ eq (mod_nested.double 21) 42 "nested import"
 # --- Cache: mod_math ikki marta use qilindi, bir xil namespace ---
 eq mod_math.pi m.pi "cache — bir xil qiymat"
 
+# --- par + modul import (issue #137 PR review): par lambda'lari alohida
+# thread'da modul import qiladi. module_loading/current_base thread-local
+# bo'lgani uchun parallel import soxta "sikllik import" bermaydi va base
+# to'g'ri uzatiladi (nested-dir modul ham). Har ikki lambda {ok:...} qaytadi. ---
+fn par_load n
+  use ./mod_math
+  ret mod_math.add n 1
+prl = par [(\-> par_load 10) (\-> par_load 20)]
+eq prl.0.ok 11 "par modul import 1"
+eq prl.1.ok 21 "par modul import 2"
+
 # --- Yakun ---
 if fails == 0
   log "=== 12_modules: HAMMASI O'TDI ==="
