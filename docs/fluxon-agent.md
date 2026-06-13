@@ -120,6 +120,26 @@ and `catch` need an indented body; like `if`, the whole thing is an expression
 from `catch` with `fail`. Prefer `fail 4xx` + auto-HTTP for expected request
 errors; reach for `try`/`catch` when you must recover and continue.
 
+## Parallelism
+`par [...]` runs a list of zero-arg lambdas concurrently (each on its own thread),
+waits for all, and returns results in input order. Each element is `{ok: value}`
+(lambda succeeded) or `{err: message}` (lambda raised `fail`/error) — one failure
+does NOT stop the others (partial success: 2 of 3 APIs returned). For LLM/API
+fan-out where sequential = slow. Each lambda element is WRAPPED IN PARENS — inside
+`[...]` lambda bodies have no newline boundary, so the parens delimit each body:
+```fluxon
+r = par [
+  (\-> ai.ask p1)
+  (\-> http.get u2)
+  (\-> db.one "select ..." [id])
+]
+# r -> [{ok:...} {err:"timeout"} {ok:...}]  (order preserved)
+ok = (r.filter \c -> c.ok != nil).map \c -> c.ok
+```
+`par` is a primitive, not a battery — no `use`. In argument position wrap it:
+`log (par [...])`. Inside a lambda body `skip`/`stop` are meaningless (no loop) →
+reported as `err`.
+
 ## Tests
 ```fluxon
 assert (total == 10) "total must be 10"  # falsy → error with message, file fails
