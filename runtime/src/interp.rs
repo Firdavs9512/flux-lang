@@ -1800,6 +1800,17 @@ impl Interp {
         {
             return self.log_dispatch("info", argv);
         }
+        // par [\-> ... \-> ...] — til-darajasidagi parallel fan-out (issue #137).
+        // Lambdalar ro'yxatini har birini ALOHIDA thread'da chaqiradi, hammasini
+        // kutadi va natijalar ro'yxatini (kirish tartibida) qaytaradi. `par` global
+        // emas (pure primitiv); foydalanuvchi `par` o'zgaruvchi e'lon qilmagan
+        // bo'lsa shu yerda ushlanadi, aks holda o'zgaruvchi ustun.
+        if let Expr::Ident(id) = callee
+            && id == "par"
+            && self.lookup(id, env).is_err()
+        {
+            return self.arc_self().par_run(argv);
+        }
         let f = self.eval(callee, env)?;
         self.apply(f, argv)
     }

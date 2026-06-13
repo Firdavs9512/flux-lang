@@ -196,6 +196,29 @@ fn tc_ret
     ret "caught"
 eq (tc_ret()) "early" "ret try'dan o'tadi"
 
+# --- par: parallel fan-out (issue #137) ---
+pr = par [
+  \-> 1 + 1
+  \-> str.up "hi"
+  \-> [1 2 3].len
+]
+eq pr.len 3 "par natija soni"
+eq pr.0.ok 2 "par 1-natija ok"
+eq pr.1.ok "HI" "par 2-natija ok"
+eq pr.2.ok 3 "par 3-natija ok"
+# qisman muvaffaqiyat: fail qilgani {err}, qolganlari {ok}
+pmix = par [\-> 42  \-> fail "boom"  \-> "z"]
+eq pmix.0.ok 42 "par qisman 1-ok"
+eq pmix.1.err "boom" "par qisman 2-err"
+eq pmix.2.ok "z" "par qisman 3-ok"
+# closure capture tashqi o'zgaruvchini parallel o'qiydi
+pbase = 100
+pcap = par [\-> pbase + 1  \-> pbase + 2]
+eq pcap.0.ok 101 "par closure capture 1"
+eq pcap.1.ok 102 "par closure capture 2"
+# bo'sh ro'yxat -> bo'sh natija
+eq (par []).len 0 "par bo'sh ro'yxat"
+
 # --- Yakun ---
 if fails == 0
   log "=== 01_core: HAMMASI O'TDI ==="

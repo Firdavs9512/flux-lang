@@ -26,6 +26,7 @@ mod db_mod;
 mod http_mod;
 mod interp;
 mod lexer;
+mod par_mod;
 mod parser;
 mod queue_mod;
 mod reg_mod;
@@ -454,6 +455,82 @@ call log
 [1, 2, 3].map log
 g = log
 g "saqlangan funksiya"
+"#);
+    }
+
+    // Issue #137: par — til-darajasidagi parallel fan-out. Lambdalar ro'yxatini
+    // har birini alohida thread'da chaqiradi, hammasini kutadi, natijalar
+    // (kirish tartibida) har biri {ok:...} yoki {err:...}.
+    #[test]
+    fn par_asosiy_fan_out() {
+        run(r#"
+r = par [
+  \-> 1 + 1
+  \-> str.up "hi"
+  \-> [1 2 3].len
+]
+((r.len) == 3) | (fail "par 3 natija qaytarishi kerak")
+((r.0.ok) == 2) | (fail "1-natija {ok:2} bo'lishi kerak")
+((r.1.ok) == "HI") | (fail "2-natija {ok:HI} bo'lishi kerak")
+((r.2.ok) == 3) | (fail "3-natija {ok:3} bo'lishi kerak")
+"#);
+    }
+
+    // Issue #137: qisman muvaffaqiyat — bitta lambda fail qilsa qolganlari
+    // to'xtamaydi; xato {err:xabar} bo'lib qaytadi, tartib saqlanadi.
+    #[test]
+    fn par_qisman_muvaffaqiyat() {
+        run(r#"
+r = par [
+  \-> 42
+  \-> fail "qasddan"
+  \-> "uchinchi"
+]
+((r.0.ok) == 42) | (fail "1-natija ok bo'lishi kerak")
+((r.1.err) == "qasddan") | (fail "2-natija err bo'lishi kerak")
+((r.2.ok) == "uchinchi") | (fail "3-natija ok bo'lishi kerak")
+"#);
+    }
+
+    // Issue #137: closure tashqi (sikl/scope) o'zgaruvchini parallel o'qiy oladi.
+    #[test]
+    fn par_closure_capture() {
+        run(r#"
+base = 100
+r = par [\-> base + 1  \-> base + 2]
+((r.0.ok) == 101) | (fail "closure capture 1 buzildi")
+((r.1.ok) == 102) | (fail "closure capture 2 buzildi")
+"#);
+    }
+
+    // Issue #137: bo'sh ro'yxat -> bo'sh natija (thread ochilmaydi).
+    #[test]
+    fn par_bosh_royxat() {
+        run(r#"
+r = par []
+((r.len) == 0) | (fail "par [] bo'sh ro'yxat qaytarishi kerak")
+"#);
+    }
+
+    // Issue #137: lambda bo'lmagan element aniq xato beradi (thread ochilmasdan).
+    #[test]
+    fn par_lambda_bolmagan_element_xato() {
+        let e = run_source("par [42]").unwrap_err();
+        assert!(
+            e.contains("funksiya bo'lishi kerak"),
+            "par lambda bo'lmagan elementda aniq xato kutiladi, keldi: {}",
+            e
+        );
+    }
+
+    // Issue #137: foydalanuvchi `par` nomli o'zgaruvchi e'lon qilsa u ustun
+    // (boshqa dispatch-battery'lar bilan izchil shadowing).
+    #[test]
+    fn par_ozgaruvchi_sifatida_shadow() {
+        run(r#"
+fn id v -> v
+par = (id 7)
+(par == 7) | (fail "par o'zgaruvchi sifatida shadow bo'lmadi")
 "#);
     }
 
