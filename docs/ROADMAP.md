@@ -117,7 +117,10 @@ What separates a real language from a toy is a definite answer to any input:
 - **Documentation site + interactive playground** (compiled to WASM it runs in
   the browser too).
 - **English translation** ([#58](https://github.com/Firdavs9512/fluxon-lang/issues/58))
-  — done; docs, examples, and runtime comments are now in English.
+  — mostly done: the docs, the CI/templates, and most runtime comments are in
+  English. A few leftovers remain (e.g. the `runtime/examples/public/index.html`
+  static demo is still Uzbek, and a handful of test names/comments in
+  `http_mod.rs`); finish these before calling the task complete.
 - **Versioning the spec:** `fluxon-agent.md` is frozen as v0.1, breaking changes
   only with a version bump. A "real language" means a promise that code written
   today still works tomorrow.
